@@ -211,7 +211,7 @@ def create_artcraft_router(
     async def bridge_health() -> dict[str, Any]:
         return {
             "success": True,
-            "comfy": settings.comfyui_base_url,
+            "comfy": comfy_client.base_url,
             "workflow_loaded": True,
             "studio_bridge": True,
         }

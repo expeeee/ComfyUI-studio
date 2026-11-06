@@ -108,6 +108,28 @@ export interface TemplateDetailResponse {
   editor_workflow: Record<string, any>
 }
 
+export interface SettingsInfo {
+  studio_host: string
+  studio_port: number
+  comfyui_url: string
+  default_comfyui_url: string
+  is_custom_comfyui_url: boolean
+  default_segment_seconds: number
+  models_root: string
+  data_dir: string
+  has_hf_token: boolean
+  hf_token_masked: string
+  has_civitai_token: boolean
+  civitai_token_masked: string
+}
+
+export interface UpdateSettingsPayload {
+  hf_token?: string
+  civitai_token?: string
+  comfyui_url?: string
+  default_segment_seconds?: number
+}
+
 export function formatBytes(bytes: number | null | undefined): string {
   if (!bytes || bytes <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']

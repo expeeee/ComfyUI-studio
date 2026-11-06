@@ -162,3 +162,49 @@ async def test_artcraft_storyteller_and_omnigen_adapter():
         jobs = await client.post("/v1/jobs/session", json={"job_tokens": []})
         assert jobs.status_code == 200
         assert "jobs" in jobs.json()
+
+
+@pytest.mark.asyncio
+async def test_settings_and_configuration_endpoints():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Initial settings
+        s = await client.get("/api/settings")
+        assert s.status_code == 200
+        sdata = s.json()
+        assert "studio_port" in sdata
+        assert "comfyui_url" in sdata
+        assert "default_segment_seconds" in sdata
+        assert sdata["default_segment_seconds"] >= 2
+
+        # Update settings
+        up = await client.post(
+            "/api/settings",
+            json={
+                "hf_token": "hf_testdummytoken12345",
+                "civitai_token": "civ_testdummytoken67890",
+                "comfyui_url": "http://127.0.0.1:8189",
+                "default_segment_seconds": 15,
+            },
+        )
+        assert up.status_code == 200
+        udata = up.json()
+        assert udata["has_hf_token"] is True
+        assert udata["has_civitai_token"] is True
+        assert udata["comfyui_url"] == "http://127.0.0.1:8189"
+        assert udata["is_custom_comfyui_url"] is True
+        assert udata["default_segment_seconds"] == 15
+
+        # Reset ComfyUI URL to default
+        reset = await client.post(
+            "/api/settings",
+            json={
+                "comfyui_url": udata["default_comfyui_url"],
+                "default_segment_seconds": 10,
+            },
+        )
+        assert reset.status_code == 200
+        rdata = reset.json()
+        assert rdata["is_custom_comfyui_url"] is False
+        assert rdata["comfyui_url"] == rdata["default_comfyui_url"]
+        assert rdata["default_segment_seconds"] == 10

@@ -418,7 +418,7 @@ class RunExecutionTracker:
         return self.db.delete_run(run_id)
 
     async def _monitor_run(self, run_id: str, prompt_id: str, client_id: str) -> None:
-        ws_url = f"{self.cfg.comfyui_ws_url}?clientId={client_id}"
+        ws_url = f"{self.comfy.ws_url}?clientId={client_id}"
         try:
             # Run WS listener and history poller concurrently so we never miss fast completions
             await asyncio.gather(

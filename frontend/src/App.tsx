@@ -4,8 +4,10 @@ import {
   ExtractedParameter,
   formatBytes,
   RunRecord,
+  SettingsInfo,
   TemplateDetailResponse,
   TemplateSummary,
+  UpdateSettingsPayload,
 } from './api'
 import { Model3DViewer } from './Model3DViewer'
 
@@ -32,8 +34,13 @@ export function App() {
   const [actionError, setActionError] = useState<string | null>(null)
 
   const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false)
+  const [settingsInfo, setSettingsInfo] = useState<SettingsInfo | null>(null)
+  const [comfyUrlInput, setComfyUrlInput] = useState<string>('')
   const [hfTokenInput, setHfTokenInput] = useState<string>('')
-  const [settingsInfo, setSettingsInfo] = useState<any>(null)
+  const [civitaiTokenInput, setCivitaiTokenInput] = useState<string>('')
+  const [segmentSecondsInput, setSegmentSecondsInput] = useState<number>(10)
+  const [savingSettings, setSavingSettings] = useState<boolean>(false)
+  const [settingsStatusMsg, setSettingsStatusMsg] = useState<string | null>(null)
 
   const [segmentMode, setSegmentMode] = useState<boolean>(false)
   const [segmentSeconds, setSegmentSeconds] = useState<number>(10)
@@ -50,7 +57,12 @@ export function App() {
       .catch(() => {})
     fetch('/api/settings')
       .then((r) => r.json())
-      .then(setSettingsInfo)
+      .then((data: SettingsInfo) => {
+        setSettingsInfo(data)
+        setComfyUrlInput(data.comfyui_url)
+        setSegmentSecondsInput(data.default_segment_seconds || 10)
+        setSegmentSeconds(data.default_segment_seconds || 10)
+      })
       .catch(() => {})
     refreshRuns()
   }, [])
@@ -430,16 +442,61 @@ export function App() {
     URL.revokeObjectURL(url)
   }
 
+  const openSettingsModal = () => {
+    if (settingsInfo) {
+      setComfyUrlInput(settingsInfo.comfyui_url)
+      setSegmentSecondsInput(settingsInfo.default_segment_seconds || 10)
+    }
+    setHfTokenInput('')
+    setCivitaiTokenInput('')
+    setSettingsStatusMsg(null)
+    setShowSettingsModal(true)
+  }
+
+  const handleResetComfyUrl = () => {
+    if (settingsInfo) {
+      setComfyUrlInput(settingsInfo.default_comfyui_url)
+    }
+  }
+
   const handleSaveSettings = async () => {
-    const r = await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hf_token: hfTokenInput }),
-    })
-    if (r.ok) {
-      setSettingsInfo(await r.json())
-      setHfTokenInput('')
-      setShowSettingsModal(false)
+    setSavingSettings(true)
+    setSettingsStatusMsg(null)
+    try {
+      const payload: UpdateSettingsPayload = {
+        comfyui_url: comfyUrlInput.trim(),
+        default_segment_seconds: Number(segmentSecondsInput) || 10,
+      }
+      if (hfTokenInput.trim()) {
+        payload.hf_token = hfTokenInput.trim()
+      }
+      if (civitaiTokenInput.trim()) {
+        payload.civitai_token = civitaiTokenInput.trim()
+      }
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (r.ok) {
+        const updated: SettingsInfo = await r.json()
+        setSettingsInfo(updated)
+        setComfyUrlInput(updated.comfyui_url)
+        setSegmentSecondsInput(updated.default_segment_seconds)
+        setSegmentSeconds(updated.default_segment_seconds)
+        setHfTokenInput('')
+        setCivitaiTokenInput('')
+        setSettingsStatusMsg('Settings saved successfully!')
+        fetch('/api/health').then((res) => res.json()).then(setHealth).catch(() => {})
+        refreshCatalog()
+        setTimeout(() => setSettingsStatusMsg(null), 3000)
+      } else {
+        setSettingsStatusMsg('Failed to save settings.')
+      }
+    } catch (e: any) {
+      setSettingsStatusMsg(`Error saving settings: ${e.message}`)
+    } finally {
+      setSavingSettings(false)
     }
   }
 
@@ -729,9 +786,9 @@ export function App() {
           <button
             className="btn btn-secondary"
             style={{ padding: '0.32rem 0.7rem', fontSize: '0.78rem' }}
-            onClick={() => setShowSettingsModal(true)}
+            onClick={openSettingsModal}
           >
-            Tokens & Settings {settingsInfo?.has_hf_token ? '✓' : ''}
+            ⚙ Studio Settings {settingsInfo?.has_hf_token || settingsInfo?.is_custom_comfyui_url ? '✓' : ''}
           </button>
         </div>
       </header>
@@ -1447,48 +1504,285 @@ export function App() {
         </aside>
       </div>
 
-      {/* Optional Token Settings Modal */}
+      {/* Studio Configuration & Settings Modal */}
       {showSettingsModal && (
         <div
           style={{
             position: 'fixed',
             inset: 0,
-            background: 'rgba(0,0,0,0.65)',
+            background: 'rgba(0,0,0,0.7)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            zIndex: 50,
+            zIndex: 100,
+            padding: '1rem',
+          }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowSettingsModal(false)
           }}
         >
-          <div className="step-card" style={{ width: 440, maxWidth: '92vw' }}>
-            <h3 style={{ marginTop: 0 }}>Model Provider Tokens</h3>
-            <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-              Optional: Configure a Hugging Face token to download gated models (e.g. Flux) directly
-              to <code>/Beta/ComfyUI/models</code>.
-            </p>
-            <div className="field-group">
-              <div className="field-label">
-                <span>Hugging Face Token (hf_...)</span>
-                {settingsInfo?.has_hf_token && (
-                  <span style={{ color: 'var(--success)' }}>
-                    Saved ({settingsInfo.hf_token_masked})
-                  </span>
-                )}
-              </div>
-              <input
-                className="field-input"
-                type="password"
-                placeholder="hf_..."
-                value={hfTokenInput}
-                onChange={(e) => setHfTokenInput(e.target.value)}
-              />
+          <div
+            className="step-card"
+            style={{
+              width: 540,
+              maxWidth: '95vw',
+              maxHeight: '88vh',
+              overflowY: 'auto',
+              boxShadow: '0 12px 36px rgba(0,0,0,0.6)',
+              border: '1px solid var(--border-color)',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '0.8rem',
+              }}
+            >
+              <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span>⚙</span> ComfyUI Studio Settings
+              </h3>
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '0.2rem 0.6rem', fontSize: '0.8rem' }}
+                onClick={() => setShowSettingsModal(false)}
+              >
+                ✕
+              </button>
             </div>
+
+            {settingsStatusMsg && (
+              <div
+                style={{
+                  background:
+                    settingsStatusMsg.includes('Error') || settingsStatusMsg.includes('Failed')
+                      ? 'rgba(239, 68, 68, 0.2)'
+                      : 'rgba(34, 197, 94, 0.2)',
+                  color:
+                    settingsStatusMsg.includes('Error') || settingsStatusMsg.includes('Failed')
+                      ? 'var(--danger)'
+                      : 'var(--success)',
+                  padding: '0.5rem 0.8rem',
+                  borderRadius: 6,
+                  fontSize: '0.82rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                {settingsStatusMsg}
+              </div>
+            )}
+
+            {/* Section 1: ComfyUI Server Connection */}
+            <div
+              style={{
+                borderBottom: '1px solid var(--border-color)',
+                paddingBottom: '1rem',
+                marginBottom: '1rem',
+              }}
+            >
+              <div style={{ fontWeight: 600, fontSize: '0.88rem', marginBottom: '0.3rem' }}>
+                ComfyUI Server Connection
+              </div>
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 0.6rem 0' }}>
+                The backend ComfyUI service instance used for node inspection, media uploads, and execution.
+              </p>
+              <div className="field-group">
+                <div className="field-label" style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span>ComfyUI URL (HTTP)</span>
+                  {settingsInfo?.is_custom_comfyui_url ? (
+                    <span style={{ color: 'var(--accent)', fontSize: '0.74rem' }}>
+                      Custom Override Active
+                    </span>
+                  ) : (
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.74rem' }}>
+                      Default ({settingsInfo?.default_comfyui_url})
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input
+                    className="field-input"
+                    type="text"
+                    placeholder="http://127.0.0.1:8188"
+                    value={comfyUrlInput}
+                    onChange={(e) => setComfyUrlInput(e.target.value)}
+                    style={{ flex: 1 }}
+                  />
+                  {settingsInfo?.is_custom_comfyui_url && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.76rem', whiteSpace: 'nowrap' }}
+                      onClick={handleResetComfyUrl}
+                      title="Reset back to default environment URL"
+                    >
+                      Reset Default
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Section 2: Model Provider Tokens */}
+            <div
+              style={{
+                borderBottom: '1px solid var(--border-color)',
+                paddingBottom: '1rem',
+                marginBottom: '1rem',
+              }}
+            >
+              <div style={{ fontWeight: 600, fontSize: '0.88rem', marginBottom: '0.3rem' }}>
+                Model Provider Tokens
+              </div>
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 0.6rem 0' }}>
+                Tokens used by the 1-click model installer for gated or authenticated repositories (stored securely in local SQLite).
+              </p>
+
+              <div className="field-group" style={{ marginBottom: '0.8rem' }}>
+                <div className="field-label">
+                  <span>Hugging Face Access Token</span>
+                  {settingsInfo?.has_hf_token && (
+                    <span style={{ color: 'var(--success)', fontSize: '0.74rem' }}>
+                      Configured ({settingsInfo.hf_token_masked})
+                    </span>
+                  )}
+                </div>
+                <input
+                  className="field-input"
+                  type="password"
+                  placeholder="hf_..."
+                  value={hfTokenInput}
+                  onChange={(e) => setHfTokenInput(e.target.value)}
+                />
+              </div>
+
+              <div className="field-group">
+                <div className="field-label">
+                  <span>CivitAI API Token</span>
+                  {settingsInfo?.has_civitai_token && (
+                    <span style={{ color: 'var(--success)', fontSize: '0.74rem' }}>
+                      Configured ({settingsInfo.civitai_token_masked})
+                    </span>
+                  )}
+                </div>
+                <input
+                  className="field-input"
+                  type="password"
+                  placeholder="Optional CivitAI API token..."
+                  value={civitaiTokenInput}
+                  onChange={(e) => setCivitaiTokenInput(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* Section 3: Workflow Defaults */}
+            <div
+              style={{
+                borderBottom: '1px solid var(--border-color)',
+                paddingBottom: '1rem',
+                marginBottom: '1rem',
+              }}
+            >
+              <div style={{ fontWeight: 600, fontSize: '0.88rem', marginBottom: '0.3rem' }}>
+                Workflow & Execution Defaults
+              </div>
+              <div className="field-group">
+                <div className="field-label">
+                  <span>Default Long-Video Segment Duration (Seconds)</span>
+                </div>
+                <input
+                  className="field-input"
+                  type="number"
+                  min="2"
+                  max="120"
+                  step="1"
+                  value={segmentSecondsInput}
+                  onChange={(e) =>
+                    setSegmentSecondsInput(Math.max(2, parseInt(e.target.value, 10) || 10))
+                  }
+                  style={{ width: 140 }}
+                />
+                <span
+                  style={{
+                    fontSize: '0.76rem',
+                    color: 'var(--text-muted)',
+                    display: 'block',
+                    marginTop: '0.2rem',
+                  }}
+                >
+                  Chunk duration used when running long-video segmented batch mode.
+                </span>
+              </div>
+            </div>
+
+            {/* Section 4: System Information */}
+            <div
+              style={{
+                marginBottom: '1.2rem',
+                background: 'rgba(255,255,255,0.03)',
+                padding: '0.7rem',
+                borderRadius: 6,
+              }}
+            >
+              <div
+                style={{
+                  fontWeight: 600,
+                  fontSize: '0.82rem',
+                  marginBottom: '0.4rem',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                System & Environment
+              </div>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '130px 1fr',
+                  gap: '0.3rem 0.5rem',
+                  fontSize: '0.78rem',
+                }}
+              >
+                <span style={{ color: 'var(--text-muted)' }}>Studio Address:</span>
+                <code>
+                  {settingsInfo?.studio_host || '0.0.0.0'}:{settingsInfo?.studio_port || 8190}
+                </code>
+
+                <span style={{ color: 'var(--text-muted)' }}>Models Directory:</span>
+                <code style={{ wordBreak: 'break-all' }}>{settingsInfo?.models_root || '-'}</code>
+
+                <span style={{ color: 'var(--text-muted)' }}>Data Directory:</span>
+                <code style={{ wordBreak: 'break-all' }}>{settingsInfo?.data_dir || '-'}</code>
+
+                <span style={{ color: 'var(--text-muted)' }}>ComfyUI Status:</span>
+                <span>
+                  {health?.comfyui_online ? (
+                    <span style={{ color: 'var(--success)' }}>
+                      ● Online ({health.comfyui_system?.system?.comfyui_version || '0.44+'})
+                    </span>
+                  ) : (
+                    <span style={{ color: 'var(--danger)' }}>○ Unreachable</span>
+                  )}
+                </span>
+              </div>
+            </div>
+
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-              <button className="btn btn-secondary" onClick={() => setShowSettingsModal(false)}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setShowSettingsModal(false)}
+                disabled={savingSettings}
+              >
                 Close
               </button>
-              <button className="btn btn-primary" onClick={handleSaveSettings}>
-                Save Token
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleSaveSettings}
+                disabled={savingSettings}
+              >
+                {savingSettings ? 'Saving...' : 'Save Settings'}
               </button>
             </div>
           </div>

@@ -346,6 +346,11 @@ class StudioDatabase:
             )
             conn.commit()
 
+    def delete_setting(self, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+            conn.commit()
+
     # --- ArtCraft Media Registry ---
     def save_artcraft_media(
         self,

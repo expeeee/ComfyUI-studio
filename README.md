@@ -76,6 +76,44 @@ npm run build
 
 ---
 
+## Configuration
+
+ComfyUI Studio supports configuration via environment variables, `.env` file, and dynamic runtime configuration in the Web UI:
+
+### 1. Environment Variables & `.env`
+
+Copy `.env.example` to `.env` in the `studio/` root to set overrides:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `STUDIO_HOST` | `0.0.0.0` | IP address or interface ComfyUI Studio listens on |
+| `STUDIO_PORT` | `8190` | Port ComfyUI Studio listens on |
+| `STUDIO_COMFYUI_URL` | `http://127.0.0.1:8188` | Default upstream ComfyUI HTTP server URL |
+| `STUDIO_COMFYUI_WS_URL` | `ws://127.0.0.1:8188/ws` | Default ComfyUI WebSocket endpoint (auto-derived if omitted) |
+| `STUDIO_MODELS_ROOT` | `/Beta/ComfyUI/models` | Base storage directory for model weights |
+| `STUDIO_COMFYUI_ROOT` | `/opt/comfyui/ComfyUI` | Base directory of the ComfyUI installation |
+| `STUDIO_COMFYUI_SITE_PACKAGES` | `/opt/comfyui/venv/lib/python3.12/site-packages` | Path to ComfyUI's python site-packages (for templates) |
+| `STUDIO_DATA_DIR` | `studio/data` | SQLite DB, cached sample inputs, and video segment stitches |
+| `STUDIO_FRONTEND_DIST_DIR` | `studio/frontend/dist` | Built Vite frontend distribution directory |
+| `STUDIO_DEFAULT_SEGMENT_SECONDS` | `10` | Default segment duration for long-video batching |
+| `STUDIO_CORS_ORIGINS` | `*` | Allowed CORS origins (comma-separated, e.g. `http://localhost:5173`) |
+| `HF_TOKEN` | _None_ | Hugging Face user access token for gated models |
+| `CIVITAI_TOKEN` | _None_ | CivitAI API token for authenticated model downloads |
+
+### 2. Runtime Web UI Settings (`⚙ Studio Settings`)
+
+Click the **`⚙ Studio Settings`** button in the top navigation bar to configure settings live in the browser without restarting the service:
+- **ComfyUI Server URL:** Point Studio to any local, LAN, or remote ComfyUI instance on the fly (with a one-click **Reset Default** button).
+- **Model Provider Tokens:** Securely save Hugging Face and CivitAI tokens directly to local SQLite.
+- **Workflow Defaults:** Adjust default chunk seconds for long-video batching.
+- **System & Environment Overview:** View active bind address, models root, data directory, and live ComfyUI version/status.
+
+---
+
 ## Running as a `systemd` Service
 
 Install and enable `deploy/comfyui-studio.service` so ComfyUI Studio starts automatically on boot alongside `comfyui.service`:

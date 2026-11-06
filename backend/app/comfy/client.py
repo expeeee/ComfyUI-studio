@@ -6,15 +6,24 @@ from typing import Any
 
 import httpx
 
-from app.config import Settings, settings
+from app.config import Settings, derive_ws_url, settings
 
 
 class ComfyUIClient:
-    def __init__(self, cfg: Settings = settings) -> None:
+    def __init__(self, cfg: Settings = settings, base_url: str | None = None) -> None:
         self.cfg = cfg
-        self.base_url = cfg.comfyui_base_url.rstrip("/")
+        self.base_url = (base_url or cfg.comfyui_base_url).rstrip("/")
         self._object_info_cache: dict[str, Any] | None = None
         self._object_info_ts: float = 0.0
+
+    @property
+    def ws_url(self) -> str:
+        return derive_ws_url(self.base_url)
+
+    def set_base_url(self, url: str) -> None:
+        self.base_url = url.rstrip("/")
+        self._object_info_cache = None
+        self._object_info_ts = 0.0
 
     async def get_system_stats(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:

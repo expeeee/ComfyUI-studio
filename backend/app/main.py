@@ -25,14 +25,15 @@ app = FastAPI(title="ComfyUI Studio API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 db = StudioDatabase()
-comfy_client = ComfyUIClient()
+custom_comfy_url = db.get_setting("comfyui_url")
+comfy_client = ComfyUIClient(base_url=custom_comfy_url)
 inspector = TemplateCatalogInspector()
 download_manager = ModelDownloadManager(db=db)
 run_tracker = RunExecutionTracker(db=db, comfy=comfy_client)
@@ -65,6 +66,8 @@ class ImportAssetUrlRequest(BaseModel):
 class UpdateSettingsRequest(BaseModel):
     hf_token: str | None = None
     civitai_token: str | None = None
+    comfyui_url: str | None = None
+    default_segment_seconds: int | None = None
 
 
 @app.get("/api/health")
@@ -81,7 +84,7 @@ async def get_health() -> dict[str, Any]:
     return {
         "status": "ok" if comfy_online else "degraded",
         "comfyui_online": comfy_online,
-        "comfyui_url": settings.comfyui_base_url,
+        "comfyui_url": comfy_client.base_url,
         "models_root": str(settings.models_root),
         "disk": disk,
         "comfyui_system": comfy_stats,
@@ -593,7 +596,18 @@ async def proxy_comfy_view(
 async def get_settings() -> dict[str, Any]:
     hf = db.get_setting("hf_token") or settings.hf_token or ""
     civ = db.get_setting("civitai_token") or settings.civitai_token or ""
+    custom_comfy_url = db.get_setting("comfyui_url")
+    effective_comfy_url = comfy_client.base_url
+    default_seg_sec = int(db.get_setting("default_segment_seconds") or settings.default_segment_seconds)
     return {
+        "studio_host": settings.host,
+        "studio_port": settings.port,
+        "comfyui_url": effective_comfy_url,
+        "default_comfyui_url": settings.comfyui_base_url,
+        "is_custom_comfyui_url": bool(custom_comfy_url),
+        "default_segment_seconds": default_seg_sec,
+        "models_root": str(settings.models_root),
+        "data_dir": str(settings.data_dir),
         "has_hf_token": bool(hf),
         "hf_token_masked": f"{hf[:4]}...{hf[-4:]}" if len(hf) > 8 else ("***" if hf else ""),
         "has_civitai_token": bool(civ),
@@ -607,6 +621,17 @@ async def update_settings(req: UpdateSettingsRequest) -> dict[str, Any]:
         db.set_setting("hf_token", req.hf_token.strip())
     if req.civitai_token is not None:
         db.set_setting("civitai_token", req.civitai_token.strip())
+    if req.comfyui_url is not None:
+        cleaned_url = req.comfyui_url.strip().rstrip("/")
+        if cleaned_url and cleaned_url != settings.comfyui_base_url.rstrip("/"):
+            db.set_setting("comfyui_url", cleaned_url)
+            comfy_client.set_base_url(cleaned_url)
+        else:
+            db.delete_setting("comfyui_url")
+            comfy_client.set_base_url(settings.comfyui_base_url)
+    if req.default_segment_seconds is not None:
+        if req.default_segment_seconds > 0:
+            db.set_setting("default_segment_seconds", str(req.default_segment_seconds))
     return await get_settings()
 
 
