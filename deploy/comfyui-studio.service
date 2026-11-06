@@ -1,0 +1,21 @@
+[Unit]
+Description=ComfyUI Studio Template Workspace & ArtCraft OmniGen Bridge
+After=network-online.target comfyui.service
+Wants=network-online.target comfyui.service
+
+[Service]
+Type=simple
+User=xpchen
+Group=comfyui
+WorkingDirectory=/Fast/AI/ComfyUI/studio/backend
+Environment=PYTHONUNBUFFERED=1
+Environment=STUDIO_HOST=0.0.0.0
+Environment=STUDIO_PORT=8190
+ExecStart=/Fast/AI/ComfyUI/studio/start.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
