@@ -174,6 +174,11 @@ export function PhotoStudio({
   const [secondImageB64, setSecondImageB64] = useState<string | null>(null)
   const [secondImageName, setSecondImageName] = useState<string | null>(null)
 
+  // Drag & Drop + Google Photos / URL Import state
+  const [urlImportInput, setUrlImportInput] = useState('')
+  const [importingUrl, setImportingUrl] = useState(false)
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
+
   // Character Isolation & 3D Studio state
   const [isolationTarget, setIsolationTarget] = useState<
     'main_character' | 'group' | 'masked' | 'custom'
@@ -465,10 +470,157 @@ export function PhotoStudio({
     reader.onload = () => {
       if (typeof reader.result === 'string') {
         pushRevision(reader.result, `Loaded: ${file.name}`)
+        onAddScratchItem({
+          kind: 'image',
+          label: file.name,
+          url: reader.result,
+          metaText: 'Local File',
+        })
       }
     }
     reader.readAsDataURL(file)
   }
+
+  const handleImportFromUrl = useCallback(
+    async (overrideUrl?: string) => {
+      const targetUrl = (overrideUrl ?? urlImportInput).trim()
+      if (!targetUrl) return
+      setImportingUrl(true)
+      setStatusBanner('Importing media from URL / Google Photos link...')
+      try {
+        const res = await fetch('/api/assets/from-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: targetUrl }),
+        })
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.detail || 'URL import failed')
+        const viewUrl =
+          data.url ||
+          `/api/view?filename=${encodeURIComponent(data.filename)}&subfolder=${encodeURIComponent(data.subfolder || '')}&type=${encodeURIComponent(data.type || 'input')}`
+        await pushRevision(viewUrl, `URL: ${data.filename}`)
+        onAddScratchItem({
+          kind: data.media_kind === 'video' ? 'video' : 'image',
+          label: data.filename,
+          url: viewUrl,
+          filename: data.filename,
+          subfolder: data.subfolder || '',
+          type: data.type || 'input',
+          metaText: 'Imported URL',
+        })
+        if (!overrideUrl) setUrlImportInput('')
+        setStatusBanner(`Imported "${data.filename}" onto Canvas & Scratch Space!`)
+      } catch (err) {
+        setStatusBanner(`URL Import failed: ${String(err)}`)
+      } finally {
+        setImportingUrl(false)
+      }
+    },
+    [urlImportInput, pushRevision, onAddScratchItem],
+  )
+
+  const handleCanvasDrop = async (e: React.DragEvent<HTMLElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDraggingOver(false)
+
+    // 1. Check dropped local file(s) from File Manager
+    const files = e.dataTransfer?.files
+    if (files && files.length > 0) {
+      const file = files[0]
+      if (file.type.startsWith('video/')) {
+        const form = new FormData()
+        form.append('file', file)
+        setStatusBanner(`Uploading dropped video ${file.name}...`)
+        const res = await fetch('/api/assets', { method: 'POST', body: form })
+        const data = await res.json()
+        if (res.ok && data.url) {
+          onAddScratchItem({
+            kind: 'video',
+            label: file.name,
+            url: data.url,
+            filename: data.filename,
+            type: 'input',
+            metaText: 'Dropped Video',
+          })
+          onSendToVideoStudio(data.url, file.name)
+        }
+        return
+      }
+      const reader = new FileReader()
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          pushRevision(reader.result, `Dropped: ${file.name}`)
+          onAddScratchItem({
+            kind: 'image',
+            label: file.name,
+            url: reader.result,
+            metaText: 'Dropped File',
+          })
+          setStatusBanner(`Loaded dropped file "${file.name}"`)
+        }
+      }
+      reader.readAsDataURL(file)
+      return
+    }
+
+    // 2. Check dropped URL or HTML <img src="..."> from Google Photos / Browser Tab
+    const uriList = e.dataTransfer?.getData('text/uri-list') || ''
+    const plainText = e.dataTransfer?.getData('text/plain') || ''
+    const htmlText = e.dataTransfer?.getData('text/html') || ''
+
+    let extractedUrl = ''
+    if (htmlText) {
+      const imgMatch = htmlText.match(/<img[^>]+src=["']([^"']+)["']/i)
+      if (imgMatch && imgMatch[1].startsWith('http')) {
+        extractedUrl = imgMatch[1].replace(/&amp;/g, '&')
+      }
+    }
+    if (!extractedUrl) {
+      const candidate = (uriList.split('\n')[0] || plainText).trim()
+      if (candidate.startsWith('http://') || candidate.startsWith('https://')) {
+        extractedUrl = candidate
+      }
+    }
+    if (extractedUrl) {
+      await handleImportFromUrl(extractedUrl)
+    }
+  }
+
+  // Support Ctrl+V clipboard paste (image blob or Google Photos / image URL)
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const activeEl = document.activeElement
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+        return
+      }
+      const items = e.clipboardData?.items
+      if (items) {
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.startsWith('image/')) {
+            const blob = items[i].getAsFile()
+            if (blob) {
+              const reader = new FileReader()
+              reader.onload = () => {
+                if (typeof reader.result === 'string') {
+                  pushRevision(reader.result, 'Pasted Clipboard Image')
+                  setStatusBanner('Loaded image from clipboard (Ctrl+V)!')
+                }
+              }
+              reader.readAsDataURL(blob)
+              return
+            }
+          }
+        }
+      }
+      const pastedText = (e.clipboardData?.getData('text/plain') || '').trim()
+      if (pastedText.startsWith('http://') || pastedText.startsWith('https://')) {
+        handleImportFromUrl(pastedText)
+      }
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [pushRevision, handleImportFromUrl])
 
   const handleSecondImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -920,6 +1072,55 @@ export function PhotoStudio({
                 >
                   ⬇ Export PNG
                 </button>
+              </div>
+
+              {/* Google Photos / Image URL Import */}
+              <div
+                style={{
+                  padding: '0.55rem',
+                  borderRadius: 8,
+                  background: 'rgba(15, 23, 42, 0.6)',
+                  border: '1px solid var(--border)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 6,
+                }}
+              >
+                <div style={{ fontSize: '0.72rem', fontWeight: 600 }}>
+                  🔗 Google Photos / Web URL Import
+                </div>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <input
+                    type="text"
+                    value={urlImportInput}
+                    onChange={(e) => setUrlImportInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleImportFromUrl()
+                    }}
+                    placeholder="Paste Google Photos share link or image URL..."
+                    style={{
+                      flex: 1,
+                      fontSize: '0.72rem',
+                      padding: '0.32rem 0.45rem',
+                      borderRadius: 6,
+                      border: '1px solid var(--border)',
+                      background: '#0f172a',
+                      color: 'var(--text-main)',
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    style={{ fontSize: '0.72rem', padding: '0.3rem 0.55rem', whiteSpace: 'nowrap' }}
+                    disabled={importingUrl || !urlImportInput.trim()}
+                    onClick={() => handleImportFromUrl()}
+                  >
+                    {importingUrl ? '...' : 'Import'}
+                  </button>
+                </div>
+                <div style={{ fontSize: '0.67rem', color: 'var(--text-muted)' }}>
+                  Tip: Drag files from File Manager, drag images/links from Google Photos, or press Ctrl+V!
+                </div>
               </div>
 
               <div
@@ -1523,6 +1724,12 @@ export function PhotoStudio({
 
       {/* CENTER WORKSPACE: Interactive Dual-Canvas + 3D Material Studio + Bottom Revision Strip */}
       <main
+        onDragOver={(e) => {
+          e.preventDefault()
+          setIsDraggingOver(true)
+        }}
+        onDragLeave={() => setIsDraggingOver(false)}
+        onDrop={handleCanvasDrop}
         style={{
           flex: 1,
           minWidth: 0,
@@ -1533,6 +1740,33 @@ export function PhotoStudio({
           background: '#070a12',
         }}
       >
+        {isDraggingOver && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 12,
+              zIndex: 50,
+              borderRadius: 14,
+              border: '2px dashed #6366f1',
+              background: 'rgba(15, 23, 42, 0.84)',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+              color: '#e0e7ff',
+              gap: 8,
+            }}
+          >
+            <div style={{ fontSize: '2.4rem' }}>📥</div>
+            <div style={{ fontSize: '1rem', fontWeight: 700 }}>
+              Drop Photo File or Google Photos Link Here
+            </div>
+            <div style={{ fontSize: '0.78rem', color: '#a5b4fc' }}>
+              Supports File Manager files (PNG/JPG/WebP) and browser image/link drags
+            </div>
+          </div>
+        )}
         {/* Top Canvas Toolbar */}
         <div
           style={{
@@ -1788,10 +2022,9 @@ export function PhotoStudio({
                 No Photo Loaded Yet
               </div>
               <div style={{ fontSize: '0.8rem', marginBottom: '1rem', lineHeight: 1.5 }}>
-                Open a photo from disk, pick from Scratch Space (`🗂️`), or ask the AI Copilot on
-                the right to generate a brand-new image!
+                Drag &amp; drop a file from your File Manager, drop or paste a Google Photos share link (`Ctrl+V`), pick from Scratch Space (`🗂️`), or ask the AI Copilot on the right to generate a brand-new image!
               </div>
-              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center' }}>
+              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center', marginBottom: '0.75rem' }}>
                 <button
                   type="button"
                   className="btn btn-primary"
@@ -1805,6 +2038,34 @@ export function PhotoStudio({
                   onClick={() => selectToolset('media')}
                 >
                   Browse Recent Generations
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input
+                  type="text"
+                  value={urlImportInput}
+                  onChange={(e) => setUrlImportInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleImportFromUrl()
+                  }}
+                  placeholder="Or paste Google Photos link / image URL..."
+                  style={{
+                    flex: 1,
+                    fontSize: '0.75rem',
+                    padding: '0.4rem 0.6rem',
+                    borderRadius: 6,
+                    border: '1px solid var(--border)',
+                    background: '#0f172a',
+                    color: 'var(--text-main)',
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={importingUrl || !urlImportInput.trim()}
+                  onClick={() => handleImportFromUrl()}
+                >
+                  {importingUrl ? 'Importing...' : '🔗 Import URL'}
                 </button>
               </div>
             </div>

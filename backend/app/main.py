@@ -354,7 +354,10 @@ async def cancel_download(download_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/assets")
+@app.post("/api/assets/upload")
 async def upload_asset(file: UploadFile = File(...)) -> dict[str, Any]:
+    import urllib.parse
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
     safe_name = Path(file.filename).name
@@ -369,10 +372,20 @@ async def upload_asset(file: UploadFile = File(...)) -> dict[str, Any]:
         content=content,
         content_type=file.content_type or "image/png",
     )
+    actual_name = res.get("name", safe_name)
+    sample_dir = settings.data_dir / "sample_inputs"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / Path(actual_name).name).write_bytes(content)
+
+    qs = urllib.parse.urlencode(
+        {"filename": actual_name, "subfolder": res.get("subfolder", ""), "type": res.get("type", "input")}
+    )
     return {
-        "filename": res.get("name", safe_name),
+        "name": actual_name,
+        "filename": actual_name,
         "subfolder": res.get("subfolder", ""),
         "type": res.get("type", "input"),
+        "url": f"/api/view?{qs}",
     }
 
 
@@ -473,10 +486,24 @@ async def import_asset_from_url(req: ImportAssetUrlRequest) -> dict[str, Any]:
         content=content,
         content_type=content_type or "image/jpeg",
     )
+    actual_name = res.get("name", safe_name)
+    sample_dir = settings.data_dir / "sample_inputs"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / Path(actual_name).name).write_bytes(content)
+
+    import urllib.parse
+
+    qs = urllib.parse.urlencode(
+        {"filename": actual_name, "subfolder": res.get("subfolder", ""), "type": res.get("type", "input")}
+    )
+    media_kind = "video" if ext in (".mp4", ".webm", ".mov", ".mkv") else "image"
     return {
-        "filename": res.get("name", safe_name),
+        "name": actual_name,
+        "filename": actual_name,
         "subfolder": res.get("subfolder", ""),
         "type": res.get("type", "input"),
+        "media_kind": media_kind,
+        "url": f"/api/view?{qs}",
     }
 
 

@@ -84,6 +84,9 @@ export function VideoStudio({
   const [chunkSeconds, setChunkSeconds] = useState<number>(defaultSegmentSeconds || 10)
   const [busyMessage, setBusyMessage] = useState<string | null>(null)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [urlImportInput, setUrlImportInput] = useState('')
+  const [importingUrl, setImportingUrl] = useState(false)
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
 
   const fps = videoMeta?.fps || 24
   const totalDuration = videoMeta?.duration || 5.0
@@ -284,9 +287,7 @@ export function VideoStudio({
     seekTo(nextTime)
   }
 
-  const handleUploadVideoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+  const uploadAndLoadFile = async (file: File) => {
     setBusyMessage(`Uploading ${file.name}...`)
     try {
       const form = new FormData()
@@ -295,12 +296,30 @@ export function VideoStudio({
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Upload failed')
       const fname = data.name || file.name
-      const qs = new URLSearchParams({ filename: fname, subfolder: '', type: 'input' })
+      const viewUrl =
+        data.url || `/api/view?${new URLSearchParams({ filename: fname, subfolder: '', type: 'input' }).toString()}`
+      if (file.type.startsWith('image/')) {
+        setFlfStartB64(viewUrl)
+        setFlfStartLabel(fname)
+        setActiveToolset('ai')
+        setLeftDrawerOpen(true)
+        onAddScratchItem({
+          kind: 'image',
+          label: fname,
+          url: viewUrl,
+          filename: fname,
+          subfolder: '',
+          type: 'input',
+          metaText: 'Dropped Image',
+        })
+        setBusyMessage(`Loaded image "${fname}" into Start Frame & Scratch Space!`)
+        return
+      }
       const uploadedClip: ActiveVideoItem = {
         filename: fname,
         subfolder: '',
         type: 'input',
-        url: `/api/view?${qs.toString()}`,
+        url: viewUrl,
         title: `Uploaded: ${fname}`,
       }
       setActiveVideo(uploadedClip)
@@ -315,7 +334,96 @@ export function VideoStudio({
       })
       setBusyMessage(`Loaded ${fname} into Video Studio & Scratch Space`)
     } catch (err) {
-      setBusyMessage(`Video upload error: ${String(err)}`)
+      setBusyMessage(`Upload error: ${String(err)}`)
+    }
+  }
+
+  const handleUploadVideoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    await uploadAndLoadFile(file)
+  }
+
+  const handleImportFromUrl = async (rawUrl?: string) => {
+    const targetUrl = (rawUrl ?? urlImportInput).trim()
+    if (!targetUrl) return
+    setImportingUrl(true)
+    setBusyMessage('Importing media from URL / Google Photos link...')
+    try {
+      const res = await fetch('/api/assets/from-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: targetUrl }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'URL import failed')
+      const fname = data.name || data.filename || 'url_import'
+      const viewUrl =
+        data.url || `/api/view?${new URLSearchParams({ filename: fname, subfolder: '', type: 'input' }).toString()}`
+      const isVideo = data.media_kind === 'video' || /\.(mp4|webm|mov|mkv)$/i.test(fname)
+      if (isVideo) {
+        const clip: ActiveVideoItem = {
+          filename: fname,
+          subfolder: '',
+          type: 'input',
+          url: viewUrl,
+          title: `Imported: ${fname}`,
+        }
+        setActiveVideo(clip)
+        onAddScratchItem({
+          kind: 'video',
+          label: fname,
+          url: viewUrl,
+          filename: fname,
+          subfolder: '',
+          type: 'input',
+          metaText: 'URL Video',
+        })
+        setBusyMessage(`Loaded video "${fname}" from URL into Player & Scratch Space!`)
+      } else {
+        setFlfStartB64(viewUrl)
+        setFlfStartLabel(fname)
+        setActiveToolset('ai')
+        setLeftDrawerOpen(true)
+        onAddScratchItem({
+          kind: 'image',
+          label: fname,
+          url: viewUrl,
+          filename: fname,
+          subfolder: '',
+          type: 'input',
+          metaText: 'Google Photos / URL',
+        })
+        setBusyMessage(`Imported "${fname}" as Start Frame & pinned to Scratch Space!`)
+      }
+      setUrlImportInput('')
+    } catch (err) {
+      setBusyMessage(`URL import error: ${String(err)}`)
+    } finally {
+      setImportingUrl(false)
+    }
+  }
+
+  const handleViewportDrop = async (e: React.DragEvent) => {
+    e.preventDefault()
+    setIsDraggingOver(false)
+    const dt = e.dataTransfer
+    if (dt.files && dt.files.length > 0) {
+      await uploadAndLoadFile(dt.files[0])
+      return
+    }
+    const html = dt.getData('text/html')
+    if (html) {
+      const m = html.match(/<img[^>]+src=["']([^"']+)["']/i)
+      if (m && m[1]?.startsWith('http')) {
+        await handleImportFromUrl(m[1])
+        return
+      }
+    }
+    const uri = (dt.getData('text/uri-list') || dt.getData('text/plain') || '').trim()
+    if (uri.startsWith('http://') || uri.startsWith('https://')) {
+      const firstLine = uri.split(/\r?\n/)[0].trim()
+      await handleImportFromUrl(firstLine)
     }
   }
 
@@ -758,6 +866,55 @@ export function VideoStudio({
               >
                 📂 Open Video File (MP4/WebM/MOV)
               </button>
+
+              {/* Google Photos / Video or Image URL Import */}
+              <div
+                style={{
+                  padding: '0.55rem',
+                  borderRadius: 8,
+                  background: 'rgba(15, 23, 42, 0.6)',
+                  border: '1px solid var(--border)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 6,
+                }}
+              >
+                <div style={{ fontSize: '0.72rem', fontWeight: 600 }}>
+                  🔗 Google Photos / Media URL Import
+                </div>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <input
+                    type="text"
+                    value={urlImportInput}
+                    onChange={(e) => setUrlImportInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleImportFromUrl()
+                    }}
+                    placeholder="Paste video URL or Google Photos link..."
+                    style={{
+                      flex: 1,
+                      fontSize: '0.72rem',
+                      padding: '0.32rem 0.45rem',
+                      borderRadius: 6,
+                      border: '1px solid var(--border)',
+                      background: '#0f172a',
+                      color: 'var(--text-main)',
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    style={{ fontSize: '0.72rem', padding: '0.3rem 0.55rem', whiteSpace: 'nowrap' }}
+                    disabled={importingUrl || !urlImportInput.trim()}
+                    onClick={() => handleImportFromUrl()}
+                  >
+                    {importingUrl ? '...' : 'Import'}
+                  </button>
+                </div>
+                <div style={{ fontSize: '0.67rem', color: 'var(--text-muted)' }}>
+                  Tip: Drag video or image files directly from your File Manager onto the player!
+                </div>
+              </div>
 
               <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 600 }}>
                 Recent Generated &amp; Cut Clips:
@@ -1487,15 +1644,49 @@ export function VideoStudio({
 
       {/* MAIN VIDEO VIEWPORT & INTERACTIVE FRAME-RANGE TIMELINE */}
       <main
+        onDragOver={(e) => {
+          e.preventDefault()
+          setIsDraggingOver(true)
+        }}
+        onDragLeave={() => setIsDraggingOver(false)}
+        onDrop={handleViewportDrop}
         style={{
           flex: 1,
           minWidth: 0,
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
+          position: 'relative',
           background: '#070a12',
         }}
       >
+        {isDraggingOver && (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 12,
+              zIndex: 50,
+              borderRadius: 14,
+              border: '2px dashed #6366f1',
+              background: 'rgba(15, 23, 42, 0.84)',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+              color: '#e0e7ff',
+              gap: 8,
+            }}
+          >
+            <div style={{ fontSize: '2.4rem' }}>🎬</div>
+            <div style={{ fontSize: '1rem', fontWeight: 700 }}>
+              Drop Video File, Image Frame, or Google Photos Link Here
+            </div>
+            <div style={{ fontSize: '0.78rem', color: '#a5b4fc' }}>
+              Videos load into the Player • Photos load into Start Frame &amp; Scratch Space
+            </div>
+          </div>
+        )}
         {/* Top Metadata & Frame Actions Bar */}
         <div
           style={{
