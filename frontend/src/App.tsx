@@ -10,8 +10,13 @@ import {
   UpdateSettingsPayload,
 } from './api'
 import { Model3DViewer } from './Model3DViewer'
+import { PhotoStudio } from './PhotoStudio'
+import { VideoStudio } from './VideoStudio'
 
 export function App() {
+  const [studioMode, setStudioMode] = useState<'templates' | 'photo' | 'video'>('templates')
+  const [photoInitialImage, setPhotoInitialImage] = useState<{ url: string; label: string } | null>(null)
+  const [videoIncomingImage, setVideoIncomingImage] = useState<{ url: string; label: string } | null>(null)
   const [health, setHealth] = useState<any>(null)
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [categories, setCategories] = useState<string[]>([])
@@ -791,9 +796,47 @@ export function App() {
     <div className="studio-shell">
       {/* Top Bar */}
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-badge">Studio</span>
-          <span>ComfyUI Template Workspace</span>
+        <div className="brand" style={{ display: 'flex', alignItems: 'center', gap: '1.1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span className="brand-badge">Studio</span>
+            <span>ComfyUI Creative Suite</span>
+          </div>
+
+          <div
+            style={{
+              display: 'flex',
+              gap: '0.35rem',
+              background: 'rgba(15, 23, 42, 0.75)',
+              padding: '0.2rem',
+              borderRadius: 8,
+              border: '1px solid var(--border)',
+            }}
+          >
+            <button
+              type="button"
+              className={`chip ${studioMode === 'templates' ? 'active' : ''}`}
+              style={{ padding: '0.28rem 0.7rem', fontSize: '0.78rem', fontWeight: 600 }}
+              onClick={() => setStudioMode('templates')}
+            >
+              🎨 Templates
+            </button>
+            <button
+              type="button"
+              className={`chip ${studioMode === 'photo' ? 'active' : ''}`}
+              style={{ padding: '0.28rem 0.7rem', fontSize: '0.78rem', fontWeight: 600 }}
+              onClick={() => setStudioMode('photo')}
+            >
+              🖼️ Photo &amp; 3D Studio
+            </button>
+            <button
+              type="button"
+              className={`chip ${studioMode === 'video' ? 'active' : ''}`}
+              style={{ padding: '0.28rem 0.7rem', fontSize: '0.78rem', fontWeight: 600 }}
+              onClick={() => setStudioMode('video')}
+            >
+              🎬 Video Studio
+            </button>
+          </div>
         </div>
         <div className="status-pills">
           <div className="pill">
@@ -817,7 +860,30 @@ export function App() {
         </div>
       </header>
 
-      <div className="main-layout">
+      {studioMode === 'photo' ? (
+        <PhotoStudio
+          runs={runs}
+          initialImageUrl={photoInitialImage?.url || null}
+          initialImageLabel={photoInitialImage?.label || null}
+          onSendToVideoStudio={(imageUrl, label) => {
+            setVideoIncomingImage({ url: imageUrl, label })
+            setStudioMode('video')
+          }}
+          onRunsUpdated={refreshRuns}
+        />
+      ) : studioMode === 'video' ? (
+        <VideoStudio
+          runs={runs}
+          defaultSegmentSeconds={settingsInfo?.default_segment_seconds || 10}
+          incomingImageForVideo={videoIncomingImage}
+          onSendFrameToPhotoStudio={(frameUrl, label) => {
+            setPhotoInitialImage({ url: frameUrl, label })
+            setStudioMode('photo')
+          }}
+          onRunsUpdated={refreshRuns}
+        />
+      ) : (
+        <div className="main-layout">
         {/* Column 1: Template Catalog */}
         <aside className="panel">
           <div className="panel-header">
@@ -1494,6 +1560,31 @@ export function App() {
                         style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}
                         onClick={(e) => e.stopPropagation()}
                       >
+                        {firstOut && firstOut.media_kind === 'image' && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '0.74rem' }}
+                            onClick={() => {
+                              setPhotoInitialImage({ url: firstOut.url, label: r.template_title })
+                              setStudioMode('photo')
+                            }}
+                            title="Open in Photo & 3D Studio"
+                          >
+                            🖼️
+                          </button>
+                        )}
+                        {firstOut && firstOut.media_kind === 'video' && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '0.74rem' }}
+                            onClick={() => setStudioMode('video')}
+                            title="Open in Video Studio"
+                          >
+                            🎬
+                          </button>
+                        )}
                         {firstOut && (
                           <a
                             className="btn btn-secondary"
@@ -1527,6 +1618,7 @@ export function App() {
           </div>
         </aside>
       </div>
+      )}
 
       {/* Studio Configuration & Settings Modal */}
       {showSettingsModal && (

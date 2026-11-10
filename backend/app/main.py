@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.artcraft import create_artcraft_router
+from app.assistant.router import create_assistant_router
 from app.comfy.client import ComfyUIClient
 from app.config import settings
 from app.db import StudioDatabase
@@ -22,6 +23,7 @@ from app.runs.tracker import RunExecutionTracker
 from app.templates.compiler import compile_workflow_to_api_prompt
 from app.templates.inspector import TemplateCatalogInspector
 from app.templates.parameters import extract_template_parameters
+from app.video.ffmpeg_router import create_video_router
 
 app = FastAPI(title="ComfyUI Studio API", version="0.1.0")
 
@@ -686,6 +688,19 @@ async def get_assistant_status() -> dict[str, Any]:
         "error": error,
     }
 
+
+# Mount AI Copilot & 3D Pipeline router (/api/assistant/*)
+app.include_router(
+    create_assistant_router(
+        db=db,
+        comfy_client=comfy_client,
+        inspector=inspector,
+        run_tracker=run_tracker,
+    )
+)
+
+# Mount FFmpeg Video Studio router (/api/video/*)
+app.include_router(create_video_router(comfy_client=comfy_client))
 
 # Mount ArtCraft Storyteller & OmniGen /v1/* adapter routes
 app.include_router(

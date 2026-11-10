@@ -137,6 +137,39 @@ export interface UpdateSettingsPayload {
   ai_engine_model?: string
 }
 
+export interface AssistantPlan {
+  action: 'execute' | 'chat'
+  template_id: string | null
+  prompt: string
+  post_process: 'replace_canvas' | 'feathered_mask_composite' | '3d_pipeline' | 'video_output' | 'none'
+}
+
+export interface AssistantChatResponse {
+  reply: string
+  plan: AssistantPlan
+  auto_executed: boolean
+  run: RunRecord | null
+  uploaded_filename: string | null
+  ai_engine_model: string
+}
+
+export interface VideoMetadata {
+  filename: string
+  duration: number
+  fps: number
+  width: number
+  height: number
+  frame_count: number
+  codec: string
+  has_audio: boolean
+}
+
+export interface VideoFilmstripFrame {
+  index: number
+  timestamp: number
+  data_url: string
+}
+
 export function formatBytes(bytes: number | null | undefined): string {
   if (!bytes || bytes <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']

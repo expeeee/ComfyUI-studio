@@ -208,3 +208,68 @@ async def test_settings_and_configuration_endpoints():
         assert rdata["is_custom_comfyui_url"] is False
         assert rdata["comfyui_url"] == rdata["default_comfyui_url"]
         assert rdata["default_segment_seconds"] == 10
+
+
+@pytest.mark.asyncio
+async def test_assistant_routing_and_3d_pipeline_graph() -> None:
+    from app.assistant.router import build_textured_3d_api_prompt, map_intent_to_template_fields
+
+    # Verify 3D Textured Pipeline graph nodes
+    graph = build_textured_3d_api_prompt(
+        subject_image_filename="hero_character.png",
+        texture_image_filename="gold_armor.png",
+        apply_texture=True,
+        render_mode="texture",
+    )
+    assert graph["1"]["class_type"] == "ImageOnlyCheckpointLoader"
+    assert graph["12"]["class_type"] == "UnwrapMesh"
+    assert graph["13"]["class_type"] == "ApplyTextureToMesh"
+    assert graph["14"]["class_type"] == "SaveGLB"
+    assert graph["15"]["class_type"] == "RenderMesh"
+    assert graph["16"]["class_type"] == "SaveImage"
+
+    # Verify template field mapping
+    f_edit = map_intent_to_template_fields(
+        "image_qwen_image_edit_2509", "Change shirt to red", "input.png"
+    )
+    assert f_edit["433:111.prompt"] == "Change shirt to red"
+    assert f_edit["78.image"] == "input.png"
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        cat = await client.get("/api/assistant/catalog")
+        assert cat.status_code == 200
+        assert len(cat.json()["catalog"]) >= 8
+
+        # Test routing for character isolation
+        chat_iso = await client.post(
+            "/api/assistant/chat",
+            json={
+                "message": "Isolate the main character in the red jacket and remove the background",
+                "canvas_filename": "sample_photo.png",
+                "has_mask": False,
+                "auto_pilot": False,
+            },
+        )
+        assert chat_iso.status_code == 200
+        iso_data = chat_iso.json()
+        assert iso_data["plan"]["action"] == "execute"
+        assert iso_data["plan"]["template_id"] in (
+            "image_qwen_image_2_1_background_removal",
+            "image_qwen_image_edit_2509",
+        )
+
+        # Test routing for localized mask edit
+        chat_mask = await client.post(
+            "/api/assistant/chat",
+            json={
+                "message": "Replace this painted area with golden roses",
+                "canvas_filename": "sample_photo.png",
+                "has_mask": True,
+                "auto_pilot": False,
+            },
+        )
+        assert chat_mask.status_code == 200
+        m_data = chat_mask.json()
+        assert m_data["plan"]["post_process"] == "feathered_mask_composite"
+
