@@ -58,6 +58,13 @@ class Settings:
     hf_token: str | None = os.environ.get("HF_TOKEN")
     civitai_token: str | None = os.environ.get("CIVITAI_TOKEN")
 
+    # Local / Network AI Assistant Engine (Lemonade / OpenAI compatible)
+    ai_engine_url: str = os.environ.get("STUDIO_AI_ENGINE_URL", "http://192.168.1.16:13305/v1")
+    ai_engine_model: str = os.environ.get(
+        "STUDIO_AI_ENGINE_MODEL", "Qwen3.8-27B-GGUF-Q4_K_M"
+    )
+    ai_engine_provider: str = os.environ.get("STUDIO_AI_ENGINE_PROVIDER", "lemonade")
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "studio.db"

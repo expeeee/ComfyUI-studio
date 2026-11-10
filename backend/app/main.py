@@ -5,6 +5,8 @@ import mimetypes
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -68,6 +70,8 @@ class UpdateSettingsRequest(BaseModel):
     civitai_token: str | None = None
     comfyui_url: str | None = None
     default_segment_seconds: int | None = None
+    ai_engine_url: str | None = None
+    ai_engine_model: str | None = None
 
 
 @app.get("/api/health")
@@ -599,6 +603,9 @@ async def get_settings() -> dict[str, Any]:
     custom_comfy_url = db.get_setting("comfyui_url")
     effective_comfy_url = comfy_client.base_url
     default_seg_sec = int(db.get_setting("default_segment_seconds") or settings.default_segment_seconds)
+    custom_ai_url = db.get_setting("ai_engine_url")
+    effective_ai_url = custom_ai_url or settings.ai_engine_url
+    effective_ai_model = db.get_setting("ai_engine_model") or settings.ai_engine_model
     return {
         "studio_host": settings.host,
         "studio_port": settings.port,
@@ -606,6 +613,11 @@ async def get_settings() -> dict[str, Any]:
         "default_comfyui_url": settings.comfyui_base_url,
         "is_custom_comfyui_url": bool(custom_comfy_url),
         "default_segment_seconds": default_seg_sec,
+        "ai_engine_url": effective_ai_url,
+        "default_ai_engine_url": settings.ai_engine_url,
+        "is_custom_ai_engine_url": bool(custom_ai_url),
+        "ai_engine_model": effective_ai_model,
+        "default_ai_engine_model": settings.ai_engine_model,
         "models_root": str(settings.models_root),
         "data_dir": str(settings.data_dir),
         "has_hf_token": bool(hf),
@@ -632,7 +644,47 @@ async def update_settings(req: UpdateSettingsRequest) -> dict[str, Any]:
     if req.default_segment_seconds is not None:
         if req.default_segment_seconds > 0:
             db.set_setting("default_segment_seconds", str(req.default_segment_seconds))
+    if req.ai_engine_url is not None:
+        cleaned_ai = req.ai_engine_url.strip().rstrip("/")
+        if cleaned_ai and cleaned_ai != settings.ai_engine_url.rstrip("/"):
+            db.set_setting("ai_engine_url", cleaned_ai)
+        else:
+            db.delete_setting("ai_engine_url")
+    if req.ai_engine_model is not None:
+        cleaned_m = req.ai_engine_model.strip()
+        if cleaned_m and cleaned_m != settings.ai_engine_model:
+            db.set_setting("ai_engine_model", cleaned_m)
+        else:
+            db.delete_setting("ai_engine_model")
     return await get_settings()
+
+
+@app.get("/api/assistant/status")
+async def get_assistant_status() -> dict[str, Any]:
+    url = (db.get_setting("ai_engine_url") or settings.ai_engine_url).rstrip("/")
+    model = db.get_setting("ai_engine_model") or settings.ai_engine_model
+    online = False
+    available_models: list[str] = []
+    error = None
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(f"{url}/models")
+            if resp.status_code == 200:
+                online = True
+                data = resp.json()
+                items = data.get("data") or []
+                available_models = [
+                    m["id"] for m in items if isinstance(m, dict) and "id" in m
+                ]
+    except Exception as exc:
+        error = str(exc)
+    return {
+        "online": online,
+        "url": url,
+        "active_model": model,
+        "available_models": available_models,
+        "error": error,
+    }
 
 
 # Mount ArtCraft Storyteller & OmniGen /v1/* adapter routes

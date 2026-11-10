@@ -39,6 +39,9 @@ export function App() {
   const [hfTokenInput, setHfTokenInput] = useState<string>('')
   const [civitaiTokenInput, setCivitaiTokenInput] = useState<string>('')
   const [segmentSecondsInput, setSegmentSecondsInput] = useState<number>(10)
+  const [aiEngineUrlInput, setAiEngineUrlInput] = useState<string>('http://192.168.1.16:13305/v1')
+  const [aiEngineModelInput, setAiEngineModelInput] = useState<string>('Qwen3.8-27B-GGUF-Q4_K_M')
+  const [assistantStatus, setAssistantStatus] = useState<any>(null)
   const [savingSettings, setSavingSettings] = useState<boolean>(false)
   const [settingsStatusMsg, setSettingsStatusMsg] = useState<string | null>(null)
 
@@ -62,7 +65,13 @@ export function App() {
         setComfyUrlInput(data.comfyui_url)
         setSegmentSecondsInput(data.default_segment_seconds || 10)
         setSegmentSeconds(data.default_segment_seconds || 10)
+        if (data.ai_engine_url) setAiEngineUrlInput(data.ai_engine_url)
+        if (data.ai_engine_model) setAiEngineModelInput(data.ai_engine_model)
       })
+      .catch(() => {})
+    fetch('/api/assistant/status')
+      .then((r) => r.json())
+      .then(setAssistantStatus)
       .catch(() => {})
     refreshRuns()
   }, [])
@@ -446,16 +455,26 @@ export function App() {
     if (settingsInfo) {
       setComfyUrlInput(settingsInfo.comfyui_url)
       setSegmentSecondsInput(settingsInfo.default_segment_seconds || 10)
+      setAiEngineUrlInput(settingsInfo.ai_engine_url || 'http://192.168.1.16:13305/v1')
+      setAiEngineModelInput(settingsInfo.ai_engine_model || 'Qwen3.8-27B-GGUF-Q4_K_M')
     }
     setHfTokenInput('')
     setCivitaiTokenInput('')
     setSettingsStatusMsg(null)
+    fetch('/api/assistant/status').then((r) => r.json()).then(setAssistantStatus).catch(() => {})
     setShowSettingsModal(true)
   }
 
   const handleResetComfyUrl = () => {
     if (settingsInfo) {
       setComfyUrlInput(settingsInfo.default_comfyui_url)
+    }
+  }
+
+  const handleResetAiUrl = () => {
+    if (settingsInfo) {
+      setAiEngineUrlInput(settingsInfo.default_ai_engine_url)
+      setAiEngineModelInput(settingsInfo.default_ai_engine_model)
     }
   }
 
@@ -466,6 +485,8 @@ export function App() {
       const payload: UpdateSettingsPayload = {
         comfyui_url: comfyUrlInput.trim(),
         default_segment_seconds: Number(segmentSecondsInput) || 10,
+        ai_engine_url: aiEngineUrlInput.trim(),
+        ai_engine_model: aiEngineModelInput.trim(),
       }
       if (hfTokenInput.trim()) {
         payload.hf_token = hfTokenInput.trim()
@@ -484,10 +505,13 @@ export function App() {
         setComfyUrlInput(updated.comfyui_url)
         setSegmentSecondsInput(updated.default_segment_seconds)
         setSegmentSeconds(updated.default_segment_seconds)
+        setAiEngineUrlInput(updated.ai_engine_url)
+        setAiEngineModelInput(updated.ai_engine_model)
         setHfTokenInput('')
         setCivitaiTokenInput('')
         setSettingsStatusMsg('Settings saved successfully!')
         fetch('/api/health').then((res) => res.json()).then(setHealth).catch(() => {})
+        fetch('/api/assistant/status').then((res) => res.json()).then(setAssistantStatus).catch(() => {})
         refreshCatalog()
         setTimeout(() => setSettingsStatusMsg(null), 3000)
       } else {
@@ -1624,7 +1648,103 @@ export function App() {
               </div>
             </div>
 
-            {/* Section 2: Model Provider Tokens */}
+            {/* Section 2: AI Assistant Engine (Lemonade / OpenAI Compatible) */}
+            <div
+              style={{
+                borderBottom: '1px solid var(--border-color)',
+                paddingBottom: '1rem',
+                marginBottom: '1rem',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: '0.3rem',
+                }}
+              >
+                <div style={{ fontWeight: 600, fontSize: '0.88rem' }}>
+                  AI Assistant Engine (Lemonade)
+                </div>
+                {assistantStatus?.online ? (
+                  <span style={{ color: 'var(--success)', fontSize: '0.74rem' }}>
+                    ● Connected ({assistantStatus.available_models?.length || 0} models available)
+                  </span>
+                ) : (
+                  <span style={{ color: 'var(--danger)', fontSize: '0.74rem' }}>
+                    ○ Disconnected {assistantStatus?.error ? `(${assistantStatus.error})` : ''}
+                  </span>
+                )}
+              </div>
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 0.6rem 0' }}>
+                Powers the Photo Studio Copilot, canvas image inspection, and automatic ComfyUI workflow routing.
+              </p>
+
+              <div className="field-group" style={{ marginBottom: '0.8rem' }}>
+                <div className="field-label" style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span>Lemonade API Base URL</span>
+                  {settingsInfo?.is_custom_ai_engine_url ? (
+                    <span style={{ color: 'var(--accent)', fontSize: '0.74rem' }}>
+                      Custom Override
+                    </span>
+                  ) : (
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.74rem' }}>
+                      Default ({settingsInfo?.default_ai_engine_url})
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input
+                    className="field-input"
+                    type="text"
+                    placeholder="http://192.168.1.16:13305/v1"
+                    value={aiEngineUrlInput}
+                    onChange={(e) => setAiEngineUrlInput(e.target.value)}
+                    style={{ flex: 1 }}
+                  />
+                  {settingsInfo?.is_custom_ai_engine_url && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.76rem', whiteSpace: 'nowrap' }}
+                      onClick={handleResetAiUrl}
+                    >
+                      Reset Default
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="field-group">
+                <div className="field-label">
+                  <span>Assistant Vision & Chat Model</span>
+                </div>
+                {assistantStatus?.available_models && assistantStatus.available_models.length > 0 ? (
+                  <select
+                    className="field-input"
+                    value={aiEngineModelInput}
+                    onChange={(e) => setAiEngineModelInput(e.target.value)}
+                  >
+                    {assistantStatus.available_models.map((m: string) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className="field-input"
+                    type="text"
+                    placeholder="Qwen3.8-27B-GGUF-Q4_K_M"
+                    value={aiEngineModelInput}
+                    onChange={(e) => setAiEngineModelInput(e.target.value)}
+                  />
+                )}
+              </div>
+            </div>
+
+            {/* Section 3: Model Provider Tokens */}
             <div
               style={{
                 borderBottom: '1px solid var(--border-color)',
@@ -1676,7 +1796,7 @@ export function App() {
               </div>
             </div>
 
-            {/* Section 3: Workflow Defaults */}
+            {/* Section 4: Workflow Defaults */}
             <div
               style={{
                 borderBottom: '1px solid var(--border-color)',
@@ -1716,7 +1836,7 @@ export function App() {
               </div>
             </div>
 
-            {/* Section 4: System Information */}
+            {/* Section 5: System Information */}
             <div
               style={{
                 marginBottom: '1.2rem',
@@ -1747,6 +1867,17 @@ export function App() {
                 <code>
                   {settingsInfo?.studio_host || '0.0.0.0'}:{settingsInfo?.studio_port || 8190}
                 </code>
+
+                <span style={{ color: 'var(--text-muted)' }}>AI Assistant:</span>
+                <span>
+                  {assistantStatus?.online ? (
+                    <span style={{ color: 'var(--success)' }}>
+                      ● Connected ({settingsInfo?.ai_engine_model || 'Qwen3.8-27B'})
+                    </span>
+                  ) : (
+                    <span style={{ color: 'var(--danger)' }}>○ Disconnected</span>
+                  )}
+                </span>
 
                 <span style={{ color: 'var(--text-muted)' }}>Models Directory:</span>
                 <code style={{ wordBreak: 'break-all' }}>{settingsInfo?.models_root || '-'}</code>

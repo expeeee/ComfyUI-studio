@@ -115,6 +115,11 @@ export interface SettingsInfo {
   default_comfyui_url: string
   is_custom_comfyui_url: boolean
   default_segment_seconds: number
+  ai_engine_url: string
+  default_ai_engine_url: string
+  is_custom_ai_engine_url: boolean
+  ai_engine_model: string
+  default_ai_engine_model: string
   models_root: string
   data_dir: string
   has_hf_token: boolean
@@ -128,6 +133,8 @@ export interface UpdateSettingsPayload {
   civitai_token?: string
   comfyui_url?: string
   default_segment_seconds?: number
+  ai_engine_url?: string
+  ai_engine_model?: string
 }
 
 export function formatBytes(bytes: number | null | undefined): string {
