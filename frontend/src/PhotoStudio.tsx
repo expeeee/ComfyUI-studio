@@ -4,6 +4,7 @@ import {
   AssistantPlan,
   RunOutput,
   RunRecord,
+  ScratchItem,
 } from './api'
 import { Model3DViewer } from './Model3DViewer'
 
@@ -24,8 +25,13 @@ interface ChatTurn {
   runId?: string | null
 }
 
+type LeftToolset = 'media' | 'paint' | 'adjust' | '3d' | 'scratch'
+
 interface PhotoStudioProps {
   runs: RunRecord[]
+  scratchItems: ScratchItem[]
+  onAddScratchItem: (item: Omit<ScratchItem, 'id' | 'createdAt'>) => void
+  onRemoveScratchItem: (id: string) => void
   initialImageUrl?: string | null
   initialImageLabel?: string | null
   onSendToVideoStudio: (imageUrl: string, label: string) => void
@@ -55,7 +61,6 @@ async function compositeWithFeatheredMask(
   const w = origImg.naturalWidth || origImg.width
   const h = origImg.naturalHeight || origImg.height
 
-  // 1. Prepare feathered alpha mask at full image resolution
   const alphaCanvas = document.createElement('canvas')
   alphaCanvas.width = w
   alphaCanvas.height = h
@@ -66,7 +71,6 @@ async function compositeWithFeatheredMask(
   alphaCtx.drawImage(maskCanvas, 0, 0, w, h)
   alphaCtx.filter = 'none'
 
-  // 2. Mask the AI-edited image using source-in over the feathered mask
   const maskedEditCanvas = document.createElement('canvas')
   maskedEditCanvas.width = w
   maskedEditCanvas.height = h
@@ -75,7 +79,6 @@ async function compositeWithFeatheredMask(
   maskedEditCtx.globalCompositeOperation = 'source-in'
   maskedEditCtx.drawImage(editImg, 0, 0, w, h)
 
-  // 3. Draw original base image and overlay the feathered edited region
   const outCanvas = document.createElement('canvas')
   outCanvas.width = w
   outCanvas.height = h
@@ -129,6 +132,9 @@ async function extractMaskedSubjectDataUrl(
 
 export function PhotoStudio({
   runs,
+  scratchItems,
+  onAddScratchItem,
+  onRemoveScratchItem,
   initialImageUrl,
   initialImageLabel,
   onSendToVideoStudio,
@@ -139,12 +145,17 @@ export function PhotoStudio({
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const refImageInputRef = useRef<HTMLInputElement | null>(null)
 
+  // Minimizable Dock & Toolset state
+  const [activeToolset, setActiveToolset] = useState<LeftToolset>('paint')
+  const [leftDrawerOpen, setLeftDrawerOpen] = useState<boolean>(true)
+  const [rightCopilotOpen, setRightCopilotOpen] = useState<boolean>(true)
+
   const [revisions, setRevisions] = useState<CanvasRevision[]>([])
   const [activeRevIndex, setActiveRevIndex] = useState<number>(-1)
   const [compareOriginal, setCompareOriginal] = useState(false)
 
-  // Tool & Brush state
-  const [activeTool, setActiveTool] = useState<'pan' | 'brush' | 'eraser' | 'adjust' | '3d'>('brush')
+  // Paint & Brush state
+  const [brushMode, setBrushMode] = useState<'brush' | 'eraser' | 'pan'>('brush')
   const [brushSize, setBrushSize] = useState(42)
   const [featherPx, setFeatherPx] = useState(12)
   const [hasMask, setHasMask] = useState(false)
@@ -164,13 +175,19 @@ export function PhotoStudio({
   const [secondImageName, setSecondImageName] = useState<string | null>(null)
 
   // Character Isolation & 3D Studio state
-  const [isolationTarget, setIsolationTarget] = useState<'main_character' | 'group' | 'masked' | 'custom'>('main_character')
+  const [isolationTarget, setIsolationTarget] = useState<
+    'main_character' | 'group' | 'masked' | 'custom'
+  >('main_character')
   const [customIsolationPrompt, setCustomIsolationPrompt] = useState('')
   const [figurinePrepass, setFigurinePrepass] = useState(false)
   const [apply3DTexture, setApply3DTexture] = useState(true)
   const [texturePrompt, setTexturePrompt] = useState('')
-  const [render3DMode, setRender3DMode] = useState<'texture' | 'solid' | 'normal' | 'auto'>('texture')
-  const [active3DModel, setActive3DModel] = useState<{ url: string; filename: string } | null>(null)
+  const [render3DMode, setRender3DMode] = useState<'texture' | 'solid' | 'normal' | 'auto'>(
+    'texture',
+  )
+  const [active3DModel, setActive3DModel] = useState<{ url: string; filename: string } | null>(
+    null,
+  )
 
   // AI Copilot & Run tracking state
   const [assistantOnline, setAssistantOnline] = useState<boolean | null>(null)
@@ -182,7 +199,7 @@ export function PhotoStudio({
     {
       id: 'welcome',
       role: 'assistant',
-      text: 'Welcome to Photo & 3D Studio! Load a photo, paint a mask with the brush, or ask me to isolate a character/group, remove the background, generate a textured 3D model, or edit anything on your canvas.',
+      text: 'Welcome to Photo & 3D Studio! Use the left icon rail to switch toolsets or minimize panels. Paint a mask, isolate a character/group, build a textured 3D model, or ask me anything.',
     },
   ])
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
@@ -226,7 +243,6 @@ export function PhotoStudio({
     [activeRevIndex],
   )
 
-  // Check Lemonade AI status on mount
   useEffect(() => {
     fetch('/api/assistant/status')
       .then((r) => r.json())
@@ -237,14 +253,12 @@ export function PhotoStudio({
       .catch(() => setAssistantOnline(false))
   }, [])
 
-  // Load initialImageUrl when passed from Video Studio or Recent Runs
   useEffect(() => {
     if (initialImageUrl) {
       pushRevision(initialImageUrl, initialImageLabel || 'Imported Frame')
     }
   }, [initialImageUrl, initialImageLabel])
 
-  // Render current revision + raster adjustments onto baseCanvasRef
   useEffect(() => {
     const canvas = baseCanvasRef.current
     const maskCanvas = maskCanvasRef.current
@@ -285,7 +299,6 @@ export function PhotoStudio({
     blurPx,
   ])
 
-  // Poll activeRunId until completion and apply result to canvas or 3D viewer
   useEffect(() => {
     if (!activeRunId) return
     let stopped = false
@@ -308,7 +321,13 @@ export function PhotoStudio({
 
           if (glbOut) {
             setActive3DModel({ url: glbOut.url, filename: glbOut.filename })
-            setActiveTool('3d')
+            onAddScratchItem({
+              kind: '3d',
+              label: `3D: ${glbOut.filename}`,
+              url: glbOut.url,
+              filename: glbOut.filename,
+              metaText: 'GLB Mesh',
+            })
             setStatusBanner(`3D Mesh ready: ${glbOut.filename}`)
           }
           if (imgOut) {
@@ -332,6 +351,15 @@ export function PhotoStudio({
               setStatusBanner(`Completed: ${run.template_title}`)
             }
           } else if (vidOut) {
+            onAddScratchItem({
+              kind: 'video',
+              label: run.template_title,
+              url: vidOut.url,
+              filename: vidOut.filename,
+              subfolder: vidOut.subfolder,
+              type: vidOut.type,
+              metaText: 'AI Video',
+            })
             setStatusBanner(`Video generated! Opening in Video Studio...`)
             onSendToVideoStudio(vidOut.url, run.template_title)
           }
@@ -340,9 +368,7 @@ export function PhotoStudio({
           setActiveRunId(null)
           setStatusBanner(`Run ${run.status}: ${run.error || 'Unknown error'}`)
         }
-      } catch {
-        // ignore transient polling errors
-      }
+      } catch {}
     }, 1400)
 
     return () => {
@@ -358,7 +384,17 @@ export function PhotoStudio({
     pushRevision,
     onRunsUpdated,
     onSendToVideoStudio,
+    onAddScratchItem,
   ])
+
+  const selectToolset = (ts: LeftToolset) => {
+    if (activeToolset === ts && leftDrawerOpen) {
+      setLeftDrawerOpen(false)
+    } else {
+      setActiveToolset(ts)
+      setLeftDrawerOpen(true)
+    }
+  }
 
   const clearMask = () => {
     const mc = maskCanvasRef.current
@@ -370,7 +406,7 @@ export function PhotoStudio({
 
   const paintAtEvent = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const mc = maskCanvasRef.current
-    if (!mc || (activeTool !== 'brush' && activeTool !== 'eraser')) return
+    if (!mc || brushMode === 'pan') return
     const rect = mc.getBoundingClientRect()
     const scaleX = mc.width / (rect.width || 1)
     const scaleY = mc.height / (rect.height || 1)
@@ -381,7 +417,7 @@ export function PhotoStudio({
     ctx.save()
     ctx.beginPath()
     ctx.arc(x, y, brushSize * scaleX * 0.5, 0, Math.PI * 2)
-    if (activeTool === 'eraser') {
+    if (brushMode === 'eraser') {
       ctx.globalCompositeOperation = 'destination-out'
       ctx.fillStyle = 'rgba(0,0,0,1)'
     } else {
@@ -390,7 +426,7 @@ export function PhotoStudio({
     }
     ctx.fill()
     ctx.restore()
-    if (activeTool === 'brush') setHasMask(true)
+    if (brushMode === 'brush') setHasMask(true)
   }
 
   const getMaskBoundingBoxHint = (): string | null => {
@@ -445,6 +481,19 @@ export function PhotoStudio({
       }
     }
     reader.readAsDataURL(file)
+  }
+
+  const handlePinCurrentToScratch = () => {
+    const canvas = baseCanvasRef.current
+    if (!canvas || !currentRevision) return
+    const dataUrl = canvas.toDataURL('image/png')
+    onAddScratchItem({
+      kind: 'image',
+      label: currentRevision.label,
+      url: dataUrl,
+      metaText: `${currentRevision.width}×${currentRevision.height}`,
+    })
+    setStatusBanner(`Pinned "${currentRevision.label}" to Scratch Space!`)
   }
 
   const handleBakeAdjustments = async () => {
@@ -691,515 +740,792 @@ export function PhotoStudio({
     }
   }
 
-  // Recent image/3D outputs from runs for quick 1-click loading
   const recentImageOutputs = runs
     .flatMap((r) =>
       (r.outputs || [])
         .filter((o) => o.media_kind === 'image')
         .map((o) => ({ ...o, title: r.template_title })),
     )
-    .slice(0, 8)
+    .slice(0, 12)
+
+  const toolsetButtons: Array<{ id: LeftToolset; icon: string; label: string; badge?: number }> = [
+    { id: 'media', icon: '📂', label: 'Source' },
+    { id: 'paint', icon: '🖌️', label: 'Mask' },
+    { id: 'adjust', icon: '🎛️', label: 'Adjust' },
+    { id: '3d', icon: '🧊', label: '3D Studio' },
+    { id: 'scratch', icon: '🗂️', label: 'Scratch', badge: scratchItems.length },
+  ]
 
   return (
     <div
       style={{
-        display: 'grid',
-        gridTemplateColumns: '290px 1fr 360px',
+        display: 'flex',
         height: 'calc(100vh - 58px)',
         overflow: 'hidden',
         background: 'var(--bg-main)',
       }}
     >
-      {/* LEFT PANEL: GIMP Tools + Character Isolation & 3D Studio */}
-      <aside
+      {/* Hidden File Inputs */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={handleFileUpload}
+      />
+      <input
+        ref={refImageInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={handleSecondImageUpload}
+      />
+
+      {/* FAR-LEFT DOCK: Compact Toolset Switcher + Minimize Toggle */}
+      <nav
         style={{
+          width: 60,
+          flexShrink: 0,
+          background: '#0b0f19',
           borderRight: '1px solid var(--border)',
-          background: 'var(--bg-panel)',
           display: 'flex',
           flexDirection: 'column',
-          overflowY: 'auto',
-          padding: '0.85rem',
-          gap: '0.9rem',
+          alignItems: 'center',
+          padding: '0.6rem 0.25rem',
+          gap: '0.45rem',
+          justifyContent: 'space-between',
         }}
       >
-        <div>
-          <div
-            style={{
-              fontSize: '0.74rem',
-              textTransform: 'uppercase',
-              letterSpacing: '0.06em',
-              color: 'var(--text-muted)',
-              fontWeight: 700,
-              marginBottom: '0.45rem',
-            }}
-          >
-            1. Canvas Source
-          </div>
-          <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              style={{ display: 'none' }}
-              onChange={handleFileUpload}
-            />
-            <button
-              type="button"
-              className="btn btn-primary"
-              style={{ flex: 1, fontSize: '0.78rem' }}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              📂 Open Photo
-            </button>
-            <button
-              type="button"
-              className="btn"
-              style={{ fontSize: '0.78rem' }}
-              onClick={handleExportPNG}
-              disabled={!currentRevision}
-            >
-              ⬇ Save PNG
-            </button>
-          </div>
-
-          {recentImageOutputs.length > 0 && (
-            <div style={{ marginTop: '0.55rem' }}>
-              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginBottom: 4 }}>
-                Or load from Recent Generations:
-              </div>
-              <div style={{ display: 'flex', gap: 5, overflowX: 'auto', paddingBottom: 4 }}>
-                {recentImageOutputs.map((item, idx) => (
-                  <img
-                    key={`${item.filename}-${idx}`}
-                    src={item.url}
-                    alt={item.title}
-                    title={`Load ${item.title}`}
-                    onClick={() => pushRevision(item.url, item.title)}
-                    style={{
-                      width: 44,
-                      height: 44,
-                      objectFit: 'cover',
-                      borderRadius: 6,
-                      cursor: 'pointer',
-                      border: '1px solid var(--border)',
-                      flexShrink: 0,
-                    }}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* GIMP Tool Selector */}
-        <div>
-          <div
-            style={{
-              fontSize: '0.74rem',
-              textTransform: 'uppercase',
-              letterSpacing: '0.06em',
-              color: 'var(--text-muted)',
-              fontWeight: 700,
-              marginBottom: '0.45rem',
-            }}
-          >
-            2. GIMP & Studio Tools
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem' }}>
-            <button
-              type="button"
-              className={`chip ${activeTool === 'brush' ? 'active' : ''}`}
-              onClick={() => setActiveTool('brush')}
-            >
-              🖌️ Mask Brush
-            </button>
-            <button
-              type="button"
-              className={`chip ${activeTool === 'eraser' ? 'active' : ''}`}
-              onClick={() => setActiveTool('eraser')}
-            >
-              🧹 Mask Eraser
-            </button>
-            <button
-              type="button"
-              className={`chip ${activeTool === 'adjust' ? 'active' : ''}`}
-              onClick={() => setActiveTool('adjust')}
-            >
-              🎛️ Color / Crop
-            </button>
-            <button
-              type="button"
-              className={`chip ${activeTool === '3d' ? 'active' : ''}`}
-              onClick={() => setActiveTool('3d')}
-            >
-              🧊 Isolate & 3D
-            </button>
-          </div>
-        </div>
-
-        {/* Tool-specific Inspector */}
-        {(activeTool === 'brush' || activeTool === 'eraser') && (
-          <div
-            style={{
-              padding: '0.65rem',
-              borderRadius: 8,
-              background: 'rgba(15, 23, 42, 0.65)',
-              border: '1px solid var(--border)',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '0.5rem',
-              fontSize: '0.76rem',
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>Feathered Inpaint / Subject Mask</div>
-            <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Brush Size</span>
-              <span>{brushSize}px</span>
-            </label>
-            <input
-              type="range"
-              min={5}
-              max={180}
-              value={brushSize}
-              onChange={(e) => setBrushSize(Number(e.target.value))}
-            />
-            <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Edge Feathering</span>
-              <span>{featherPx}px</span>
-            </label>
-            <input
-              type="range"
-              min={0}
-              max={40}
-              value={featherPx}
-              onChange={(e) => setFeatherPx(Number(e.target.value))}
-            />
-            <div style={{ display: 'flex', gap: '0.35rem', marginTop: 4 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', width: '100%' }}>
+          {toolsetButtons.map((tb) => {
+            const isActive = leftDrawerOpen && activeToolset === tb.id
+            return (
               <button
+                key={tb.id}
                 type="button"
-                className="chip"
-                style={{ flex: 1 }}
-                onClick={() => setShowMaskOverlay((v) => !v)}
-              >
-                {showMaskOverlay ? '👁️ Hide Mask' : '👁️ Show Mask'}
-              </button>
-              <button
-                type="button"
-                className="chip"
-                style={{ flex: 1 }}
-                onClick={clearMask}
-                disabled={!hasMask}
-              >
-                🗑️ Clear Mask
-              </button>
-            </div>
-            <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
-              Paint over any object or character. When you run an AI edit, Studio alpha-composites
-              only your feathered mask onto the original photo!
-            </div>
-          </div>
-        )}
-
-        {activeTool === 'adjust' && (
-          <div
-            style={{
-              padding: '0.65rem',
-              borderRadius: 8,
-              background: 'rgba(15, 23, 42, 0.65)',
-              border: '1px solid var(--border)',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '0.45rem',
-              fontSize: '0.75rem',
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>GIMP Raster Adjustments</div>
-            <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Brightness</span>
-              <span>{brightness}%</span>
-            </label>
-            <input
-              type="range"
-              min={40}
-              max={160}
-              value={brightness}
-              onChange={(e) => setBrightness(Number(e.target.value))}
-            />
-            <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Contrast</span>
-              <span>{contrast}%</span>
-            </label>
-            <input
-              type="range"
-              min={40}
-              max={160}
-              value={contrast}
-              onChange={(e) => setContrast(Number(e.target.value))}
-            />
-            <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Saturation</span>
-              <span>{saturation}%</span>
-            </label>
-            <input
-              type="range"
-              min={0}
-              max={200}
-              value={saturation}
-              onChange={(e) => setSaturation(Number(e.target.value))}
-            />
-            <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Warmth</span>
-              <span>{warmth}%</span>
-            </label>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={warmth}
-              onChange={(e) => setWarmth(Number(e.target.value))}
-            />
-            <div style={{ display: 'flex', gap: '0.35rem', marginTop: 4 }}>
-              <button
-                type="button"
-                className="btn btn-primary"
-                style={{ flex: 1, fontSize: '0.73rem' }}
-                onClick={handleBakeAdjustments}
-              >
-                ✨ Bake to Layer
-              </button>
-              <button
-                type="button"
-                className="chip"
-                onClick={() => {
-                  setBrightness(100)
-                  setContrast(100)
-                  setSaturation(100)
-                  setWarmth(0)
-                  setBlurPx(0)
+                onClick={() => selectToolset(tb.id)}
+                title={`${tb.label} Toolset (Click to toggle)`}
+                style={{
+                  position: 'relative',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 3,
+                  padding: '0.48rem 0.2rem',
+                  borderRadius: 8,
+                  border: isActive ? '1px solid #6366f1' : '1px solid transparent',
+                  background: isActive ? 'rgba(99, 102, 241, 0.22)' : 'transparent',
+                  color: isActive ? '#e0e7ff' : 'var(--text-muted)',
+                  cursor: 'pointer',
+                  fontSize: '0.64rem',
+                  fontWeight: 600,
                 }}
               >
-                Reset
+                <span style={{ fontSize: '1.15rem', lineHeight: 1 }}>{tb.icon}</span>
+                <span>{tb.label}</span>
+                {tb.badge ? (
+                  <span
+                    style={{
+                      position: 'absolute',
+                      top: 3,
+                      right: 4,
+                      background: '#6366f1',
+                      color: '#fff',
+                      fontSize: '0.58rem',
+                      borderRadius: 999,
+                      padding: '0 5px',
+                      fontWeight: 700,
+                    }}
+                  >
+                    {tb.badge}
+                  </span>
+                ) : null}
               </button>
-            </div>
-
-            <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.3rem 0' }} />
-            <div style={{ fontWeight: 600 }}>Transform & Aspect Crop</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.3rem' }}>
-              <button type="button" className="chip" onClick={() => handleTransform('rot_ccw')}>
-                ↺ Rotate -90°
-              </button>
-              <button type="button" className="chip" onClick={() => handleTransform('rot_cw')}>
-                ↻ Rotate +90°
-              </button>
-              <button type="button" className="chip" onClick={() => handleTransform('flip_h')}>
-                ↔ Flip H
-              </button>
-              <button type="button" className="chip" onClick={() => handleTransform('flip_v')}>
-                ↕ Flip V
-              </button>
-            </div>
-            <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', marginTop: 2 }}>
-              <button type="button" className="chip" onClick={() => handleAspectCrop(1, 1)}>
-                Crop 1:1
-              </button>
-              <button type="button" className="chip" onClick={() => handleAspectCrop(16, 9)}>
-                16:9
-              </button>
-              <button type="button" className="chip" onClick={() => handleAspectCrop(9, 16)}>
-                9:16
-              </button>
-              <button type="button" className="chip" onClick={() => handleAspectCrop(4, 3)}>
-                4:3
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Templated Character/Group Isolation + 3D Render & Texture Drawer */}
-        <div
-          style={{
-            padding: '0.7rem',
-            borderRadius: 8,
-            background: 'rgba(30, 41, 59, 0.55)',
-            border: '1px solid rgba(99, 102, 241, 0.35)',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '0.55rem',
-            fontSize: '0.75rem',
-          }}
-        >
-          <div style={{ fontWeight: 700, color: '#a5b4fc', display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span>🧊 Character Isolation & 3D Studio</span>
-          </div>
-
-          <div style={{ fontWeight: 600, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-            Step A: Isolate Subject & Remove Background
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.3rem' }}>
-            <button
-              type="button"
-              className={`chip ${isolationTarget === 'main_character' ? 'active' : ''}`}
-              style={{ fontSize: '0.7rem' }}
-              onClick={() => setIsolationTarget('main_character')}
-            >
-              🧍 Main Character
-            </button>
-            <button
-              type="button"
-              className={`chip ${isolationTarget === 'group' ? 'active' : ''}`}
-              style={{ fontSize: '0.7rem' }}
-              onClick={() => setIsolationTarget('group')}
-            >
-              👥 Character Group
-            </button>
-            <button
-              type="button"
-              className={`chip ${isolationTarget === 'masked' ? 'active' : ''}`}
-              style={{ fontSize: '0.7rem' }}
-              onClick={() => setIsolationTarget('masked')}
-            >
-              🖌️ Painted Mask
-            </button>
-            <button
-              type="button"
-              className={`chip ${isolationTarget === 'custom' ? 'active' : ''}`}
-              style={{ fontSize: '0.7rem' }}
-              onClick={() => setIsolationTarget('custom')}
-            >
-              ✍️ Custom Prompt
-            </button>
-          </div>
-
-          {isolationTarget === 'custom' && (
-            <input
-              type="text"
-              className="search-input"
-              placeholder="e.g., Isolate the knight on the left..."
-              value={customIsolationPrompt}
-              onChange={(e) => setCustomIsolationPrompt(e.target.value)}
-              style={{ fontSize: '0.74rem', padding: '0.35rem 0.5rem' }}
-            />
-          )}
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: '0.71rem' }}>
-            <input
-              type="checkbox"
-              checked={figurinePrepass}
-              onChange={(e) => setFigurinePrepass(e.target.checked)}
-            />
-            <span>Normalize lighting as 3D figurine pre-pass</span>
-          </label>
-
-          <button
-            type="button"
-            className="btn"
-            style={{ width: '100%', fontSize: '0.75rem', borderColor: '#6366f1' }}
-            onClick={handleRunCharacterIsolation}
-            disabled={!currentRevision || Boolean(activeRunId)}
-          >
-            ✂️ 1. Isolate & Remove BG (Qwen 2.1)
-          </button>
-
-          <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.2rem 0' }} />
-
-          <div style={{ fontWeight: 600, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-            Step B: 3D Mesh + UV Texture + 2D Render
-          </div>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: '0.72rem' }}>
-            <input
-              type="checkbox"
-              checked={apply3DTexture}
-              onChange={(e) => setApply3DTexture(e.target.checked)}
-            />
-            <span>UV-Unwrap & Apply Color/Texture Map</span>
-          </label>
-
-          <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
-            <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>Render Mode:</span>
-            <select
-              value={render3DMode}
-              onChange={(e) => setRender3DMode(e.target.value as any)}
-              style={{
-                flex: 1,
-                background: 'var(--bg-main)',
-                color: 'var(--text-main)',
-                border: '1px solid var(--border)',
-                borderRadius: 6,
-                padding: '0.2rem 0.4rem',
-                fontSize: '0.72rem',
-              }}
-            >
-              <option value="texture">Textured 3D Render</option>
-              <option value="solid">Shaded Clay Render</option>
-              <option value="normal">Surface Normal Map</option>
-              <option value="auto">Auto</option>
-            </select>
-          </div>
-
-          {/* Optional AI Texture Generator or Reference Texture Upload */}
-          <div style={{ display: 'flex', gap: '0.3rem' }}>
-            <input
-              type="text"
-              className="search-input"
-              placeholder="Optional material (e.g. gold armor)"
-              value={texturePrompt}
-              onChange={(e) => setTexturePrompt(e.target.value)}
-              style={{ flex: 1, fontSize: '0.71rem', padding: '0.28rem 0.45rem' }}
-            />
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem' }}
-              onClick={handleGenerateAITextureFor3D}
-              disabled={!texturePrompt.trim() || Boolean(activeRunId)}
-              title="Generate a seamless texture image on the canvas via Z-Image-Turbo"
-            >
-              🎨 Gen Tex
-            </button>
-          </div>
-
-          <button
-            type="button"
-            className="btn btn-primary"
-            style={{ width: '100%', fontSize: '0.76rem' }}
-            onClick={handleRun3DPipeline}
-            disabled={!currentRevision || Boolean(activeRunId)}
-          >
-            🧊 2. Create 3D Mesh + Texture + Render
-          </button>
+            )
+          })}
         </div>
 
-        {/* Optional 2nd Reference Image for Multi-Image Edit / Texture */}
-        <div style={{ fontSize: '0.73rem' }}>
-          <input
-            ref={refImageInputRef}
-            type="file"
-            accept="image/*"
-            style={{ display: 'none' }}
-            onChange={handleSecondImageUpload}
-          />
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ color: 'var(--text-muted)' }}>
-              Ref / Texture Image: {secondImageName || 'None'}
+        <button
+          type="button"
+          className="chip"
+          onClick={() => setLeftDrawerOpen((v) => !v)}
+          title={leftDrawerOpen ? 'Minimize Left Tool Drawer' : 'Expand Left Tool Drawer'}
+          style={{ width: '90%', padding: '0.35rem 0', fontSize: '0.75rem', textAlign: 'center' }}
+        >
+          {leftDrawerOpen ? '« Hide' : '» Show'}
+        </button>
+      </nav>
+
+      {/* MINIMIZABLE LEFT TOOLSET DRAWER */}
+      {leftDrawerOpen && (
+        <aside
+          style={{
+            width: 285,
+            flexShrink: 0,
+            borderRight: '1px solid var(--border)',
+            background: 'var(--bg-panel)',
+            display: 'flex',
+            flexDirection: 'column',
+            overflowY: 'auto',
+            padding: '0.85rem',
+            gap: '0.85rem',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              borderBottom: '1px solid var(--border)',
+              paddingBottom: '0.45rem',
+            }}
+          >
+            <span style={{ fontWeight: 700, fontSize: '0.84rem' }}>
+              {activeToolset === 'media' && '📂 Photo Source & Recent'}
+              {activeToolset === 'paint' && '🖌️ Feathered Mask & Brush'}
+              {activeToolset === 'adjust' && '🎛️ Raster Color & Crop'}
+              {activeToolset === '3d' && '🧊 Character & 3D Studio'}
+              {activeToolset === 'scratch' && `🗂️ Scratch Space (${scratchItems.length})`}
             </span>
             <button
               type="button"
               className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.15rem 0.45rem' }}
-              onClick={() =>
-                secondImageB64 ? (setSecondImageB64(null), setSecondImageName(null)) : refImageInputRef.current?.click()
-              }
+              style={{ padding: '0.1rem 0.45rem', fontSize: '0.7rem' }}
+              onClick={() => setLeftDrawerOpen(false)}
+              title="Minimize panel"
             >
-              {secondImageB64 ? 'Clear' : '+ Add Ref'}
+              «
             </button>
           </div>
-        </div>
-      </aside>
+
+          {/* TOOLSET 1: MEDIA & SOURCE */}
+          {activeToolset === 'media' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div style={{ display: 'flex', gap: '0.4rem' }}>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  style={{ flex: 1, fontSize: '0.78rem' }}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  📂 Open Photo
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ fontSize: '0.78rem' }}
+                  onClick={handleExportPNG}
+                  disabled={!currentRevision}
+                >
+                  ⬇ Export PNG
+                </button>
+              </div>
+
+              <div
+                style={{
+                  padding: '0.6rem',
+                  borderRadius: 8,
+                  background: 'rgba(15, 23, 42, 0.6)',
+                  border: '1px solid var(--border)',
+                  fontSize: '0.74rem',
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                  2nd Reference / Texture Image
+                </div>
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginBottom: 6 }}>
+                  Used for multi-image edits (`Qwen 2.1`) or custom 3D mesh texture projection.
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '0.72rem' }}>{secondImageName || 'None loaded'}</span>
+                  <button
+                    type="button"
+                    className="chip"
+                    onClick={() =>
+                      secondImageB64
+                        ? (setSecondImageB64(null), setSecondImageName(null))
+                        : refImageInputRef.current?.click()
+                    }
+                  >
+                    {secondImageB64 ? 'Clear' : '+ Load Ref'}
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <div style={{ fontSize: '0.74rem', fontWeight: 600, marginBottom: 6 }}>
+                  Recent ComfyUI Generations
+                </div>
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(3, 1fr)',
+                    gap: 6,
+                  }}
+                >
+                  {recentImageOutputs.map((item, idx) => (
+                    <div
+                      key={`${item.filename}-${idx}`}
+                      onClick={() => pushRevision(item.url, item.title)}
+                      style={{
+                        cursor: 'pointer',
+                        borderRadius: 6,
+                        overflow: 'hidden',
+                        border: '1px solid var(--border)',
+                        position: 'relative',
+                      }}
+                      title={`Click to load: ${item.title}`}
+                    >
+                      <img
+                        src={item.url}
+                        alt={item.title}
+                        style={{ width: '100%', height: 68, objectFit: 'cover', display: 'block' }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TOOLSET 2: PAINT & FEATHERED MASK */}
+          {activeToolset === 'paint' && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.6rem',
+                fontSize: '0.76rem',
+              }}
+            >
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.35rem' }}>
+                <button
+                  type="button"
+                  className={`chip ${brushMode === 'brush' ? 'active' : ''}`}
+                  onClick={() => setBrushMode('brush')}
+                >
+                  🖌️ Paint
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${brushMode === 'eraser' ? 'active' : ''}`}
+                  onClick={() => setBrushMode('eraser')}
+                >
+                  🧹 Erase
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${brushMode === 'pan' ? 'active' : ''}`}
+                  onClick={() => setBrushMode('pan')}
+                >
+                  👆 Cursor
+                </button>
+              </div>
+
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Brush Diameter</span>
+                <span>{brushSize}px</span>
+              </label>
+              <input
+                type="range"
+                min={5}
+                max={180}
+                value={brushSize}
+                onChange={(e) => setBrushSize(Number(e.target.value))}
+              />
+
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Mask Feathering (Soft Edge)</span>
+                <span>{featherPx}px</span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={40}
+                value={featherPx}
+                onChange={(e) => setFeatherPx(Number(e.target.value))}
+              />
+
+              <div style={{ display: 'flex', gap: '0.35rem' }}>
+                <button
+                  type="button"
+                  className="chip"
+                  style={{ flex: 1 }}
+                  onClick={() => setShowMaskOverlay((v) => !v)}
+                >
+                  {showMaskOverlay ? '👁️ Hide Mask' : '👁️ Show Mask'}
+                </button>
+                <button
+                  type="button"
+                  className="chip"
+                  style={{ flex: 1 }}
+                  onClick={clearMask}
+                  disabled={!hasMask}
+                >
+                  🗑️ Clear Mask
+                </button>
+              </div>
+
+              <div
+                style={{
+                  padding: '0.6rem',
+                  borderRadius: 8,
+                  background: 'rgba(15, 23, 42, 0.65)',
+                  border: '1px solid var(--border)',
+                  fontSize: '0.71rem',
+                  color: 'var(--text-muted)',
+                  lineHeight: 1.45,
+                }}
+              >
+                <strong>How Localized Fill Works:</strong> Paint ruby-red over any area on the
+                canvas, then ask the AI Copilot what to change. Studio runs <em>Qwen Image Edit</em>{' '}
+                and alpha-composites only your feathered mask back onto the original image.
+              </div>
+            </div>
+          )}
+
+          {/* TOOLSET 3: RASTER COLOR & CROP */}
+          {activeToolset === 'adjust' && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.5rem',
+                fontSize: '0.75rem',
+              }}
+            >
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Brightness</span>
+                <span>{brightness}%</span>
+              </label>
+              <input
+                type="range"
+                min={40}
+                max={160}
+                value={brightness}
+                onChange={(e) => setBrightness(Number(e.target.value))}
+              />
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Contrast</span>
+                <span>{contrast}%</span>
+              </label>
+              <input
+                type="range"
+                min={40}
+                max={160}
+                value={contrast}
+                onChange={(e) => setContrast(Number(e.target.value))}
+              />
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Saturation</span>
+                <span>{saturation}%</span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={200}
+                value={saturation}
+                onChange={(e) => setSaturation(Number(e.target.value))}
+              />
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Warmth / Sepia</span>
+                <span>{warmth}%</span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={warmth}
+                onChange={(e) => setWarmth(Number(e.target.value))}
+              />
+              <label style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Gaussian Blur</span>
+                <span>{blurPx}px</span>
+              </label>
+              <input
+                type="range"
+                min={0}
+                max={12}
+                value={blurPx}
+                onChange={(e) => setBlurPx(Number(e.target.value))}
+              />
+
+              <div style={{ display: 'flex', gap: '0.35rem', marginTop: 4 }}>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  style={{ flex: 1, fontSize: '0.74rem' }}
+                  onClick={handleBakeAdjustments}
+                >
+                  ✨ Bake to Layer
+                </button>
+                <button
+                  type="button"
+                  className="chip"
+                  onClick={() => {
+                    setBrightness(100)
+                    setContrast(100)
+                    setSaturation(100)
+                    setWarmth(0)
+                    setBlurPx(0)
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+
+              <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.35rem 0' }} />
+              <div style={{ fontWeight: 600 }}>Rotate &amp; Flip</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem' }}>
+                <button type="button" className="chip" onClick={() => handleTransform('rot_ccw')}>
+                  ↺ Rotate -90°
+                </button>
+                <button type="button" className="chip" onClick={() => handleTransform('rot_cw')}>
+                  ↻ Rotate +90°
+                </button>
+                <button type="button" className="chip" onClick={() => handleTransform('flip_h')}>
+                  ↔ Flip H
+                </button>
+                <button type="button" className="chip" onClick={() => handleTransform('flip_v')}>
+                  ↕ Flip V
+                </button>
+              </div>
+
+              <div style={{ fontWeight: 600, marginTop: 4 }}>Center Aspect Crop</div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem' }}>
+                <button type="button" className="chip" onClick={() => handleAspectCrop(1, 1)}>
+                  1:1 Square
+                </button>
+                <button type="button" className="chip" onClick={() => handleAspectCrop(16, 9)}>
+                  16:9 Widescreen
+                </button>
+                <button type="button" className="chip" onClick={() => handleAspectCrop(9, 16)}>
+                  9:16 Vertical
+                </button>
+                <button type="button" className="chip" onClick={() => handleAspectCrop(4, 3)}>
+                  4:3 Classic
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* TOOLSET 4: CHARACTER ISOLATION & 3D STUDIO */}
+          {activeToolset === '3d' && (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.6rem',
+                fontSize: '0.75rem',
+              }}
+            >
+              <div style={{ fontWeight: 600, color: '#a5b4fc' }}>
+                Step 1: Isolate Character / Group
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.3rem' }}>
+                <button
+                  type="button"
+                  className={`chip ${isolationTarget === 'main_character' ? 'active' : ''}`}
+                  style={{ fontSize: '0.7rem' }}
+                  onClick={() => setIsolationTarget('main_character')}
+                >
+                  🧍 Main Character
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${isolationTarget === 'group' ? 'active' : ''}`}
+                  style={{ fontSize: '0.7rem' }}
+                  onClick={() => setIsolationTarget('group')}
+                >
+                  👥 Character Group
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${isolationTarget === 'masked' ? 'active' : ''}`}
+                  style={{ fontSize: '0.7rem' }}
+                  onClick={() => setIsolationTarget('masked')}
+                >
+                  🖌️ Painted Mask
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${isolationTarget === 'custom' ? 'active' : ''}`}
+                  style={{ fontSize: '0.7rem' }}
+                  onClick={() => setIsolationTarget('custom')}
+                >
+                  ✍️ Custom Prompt
+                </button>
+              </div>
+
+              {isolationTarget === 'custom' && (
+                <input
+                  type="text"
+                  className="search-input"
+                  placeholder="e.g., Isolate the knight in silver armor..."
+                  value={customIsolationPrompt}
+                  onChange={(e) => setCustomIsolationPrompt(e.target.value)}
+                  style={{ fontSize: '0.74rem' }}
+                />
+              )}
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={figurinePrepass}
+                  onChange={(e) => setFigurinePrepass(e.target.checked)}
+                />
+                <span>3D Figurine clean lighting pre-pass</span>
+              </label>
+
+              <button
+                type="button"
+                className="btn"
+                style={{ width: '100%', fontSize: '0.75rem', borderColor: '#6366f1' }}
+                onClick={handleRunCharacterIsolation}
+                disabled={!currentRevision || Boolean(activeRunId)}
+              >
+                ✂️ 1. Isolate &amp; Remove BG (Qwen 2.1)
+              </button>
+
+              <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.2rem 0' }} />
+
+              <div style={{ fontWeight: 600, color: '#a5b4fc' }}>
+                Step 2: 3D Mesh + UV Texture + Render
+              </div>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={apply3DTexture}
+                  onChange={(e) => setApply3DTexture(e.target.checked)}
+                />
+                <span>UV-Unwrap &amp; Apply Color/Texture Map</span>
+              </label>
+
+              <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
+                <span style={{ color: 'var(--text-muted)', fontSize: '0.71rem' }}>Render Mode:</span>
+                <select
+                  value={render3DMode}
+                  onChange={(e) => setRender3DMode(e.target.value as any)}
+                  style={{
+                    flex: 1,
+                    background: 'var(--bg-main)',
+                    color: 'var(--text-main)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 6,
+                    padding: '0.25rem 0.4rem',
+                    fontSize: '0.72rem',
+                  }}
+                >
+                  <option value="texture">Textured 3D Render</option>
+                  <option value="solid">Shaded Clay Render</option>
+                  <option value="normal">Surface Normal Map</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </div>
+
+              <div style={{ display: 'flex', gap: '0.3rem' }}>
+                <input
+                  type="text"
+                  className="search-input"
+                  placeholder="Optional material (e.g. gold armor)"
+                  value={texturePrompt}
+                  onChange={(e) => setTexturePrompt(e.target.value)}
+                  style={{ flex: 1, fontSize: '0.72rem' }}
+                />
+                <button
+                  type="button"
+                  className="chip"
+                  style={{ fontSize: '0.68rem' }}
+                  onClick={handleGenerateAITextureFor3D}
+                  disabled={!texturePrompt.trim() || Boolean(activeRunId)}
+                >
+                  🎨 Gen Tex
+                </button>
+              </div>
+
+              <button
+                type="button"
+                className="btn btn-primary"
+                style={{ width: '100%', fontSize: '0.76rem' }}
+                onClick={handleRun3DPipeline}
+                disabled={!currentRevision || Boolean(activeRunId)}
+              >
+                🧊 2. Create 3D Mesh + Texture + Render
+              </button>
+            </div>
+          )}
+
+          {/* TOOLSET 5: SHARED SCRATCH SPACE */}
+          {activeToolset === 'scratch' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+              <button
+                type="button"
+                className="btn btn-primary"
+                style={{ fontSize: '0.75rem' }}
+                onClick={handlePinCurrentToScratch}
+                disabled={!currentRevision}
+              >
+                📌 Pin Current Canvas to Scratch Space
+              </button>
+              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                Scratch Space holds intermediate cutouts, video frames, textures, and clips across
+                Photo &amp; Video Studio.
+              </div>
+              {scratchItems.length === 0 ? (
+                <div
+                  style={{
+                    padding: '1.2rem',
+                    textAlign: 'center',
+                    border: '1px dashed var(--border)',
+                    borderRadius: 8,
+                    color: 'var(--text-muted)',
+                    fontSize: '0.74rem',
+                  }}
+                >
+                  No items in Scratch Space yet. Pin a canvas layer or capture a frame from Video
+                  Studio!
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  {scratchItems.map((item) => (
+                    <div
+                      key={item.id}
+                      style={{
+                        padding: '0.45rem',
+                        borderRadius: 8,
+                        background: 'rgba(15, 23, 42, 0.7)',
+                        border: '1px solid var(--border)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.35rem',
+                        fontSize: '0.72rem',
+                      }}
+                    >
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        {item.kind === 'image' ? (
+                          <img
+                            src={item.url}
+                            alt={item.label}
+                            style={{
+                              width: 48,
+                              height: 48,
+                              objectFit: 'cover',
+                              borderRadius: 5,
+                              flexShrink: 0,
+                            }}
+                          />
+                        ) : (
+                          <div
+                            style={{
+                              width: 48,
+                              height: 48,
+                              borderRadius: 5,
+                              background: '#1e293b',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              fontSize: '1.2rem',
+                              flexShrink: 0,
+                            }}
+                          >
+                            {item.kind === 'video' ? '🎬' : '🧊'}
+                          </div>
+                        )}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div
+                            style={{
+                              fontWeight: 600,
+                              whiteSpace: 'nowrap',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                            }}
+                          >
+                            {item.label}
+                          </div>
+                          <div style={{ fontSize: '0.66rem', color: 'var(--text-muted)' }}>
+                            {item.metaText || item.kind.toUpperCase()}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            color: '#fca5a5',
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => onRemoveScratchItem(item.id)}
+                          title="Remove from Scratch Space"
+                        >
+                          ✕
+                        </button>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        {item.kind === 'image' && (
+                          <>
+                            <button
+                              type="button"
+                              className="chip"
+                              style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
+                              onClick={() => pushRevision(item.url, item.label)}
+                            >
+                              🖼️ To Canvas
+                            </button>
+                            <button
+                              type="button"
+                              className="chip"
+                              style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
+                              onClick={() => {
+                                setSecondImageB64(item.url)
+                                setSecondImageName(item.label)
+                                setStatusBanner(`Set "${item.label}" as Reference / 3D Texture`)
+                              }}
+                            >
+                              🎨 Use as Ref/Tex
+                            </button>
+                            <button
+                              type="button"
+                              className="chip"
+                              style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
+                              onClick={() => onSendToVideoStudio(item.url, item.label)}
+                            >
+                              🎬 To Video
+                            </button>
+                          </>
+                        )}
+                        {item.kind === '3d' && (
+                          <button
+                            type="button"
+                            className="chip"
+                            style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
+                            onClick={() =>
+                              setActive3DModel({
+                                url: item.url,
+                                filename: item.filename || 'model.glb',
+                              })
+                            }
+                          >
+                            🧊 Open 3D Viewer
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </aside>
+      )}
 
       {/* CENTER WORKSPACE: Interactive Dual-Canvas + 3D Material Studio + Bottom Revision Strip */}
       <main
         style={{
+          flex: 1,
+          minWidth: 0,
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
@@ -1213,17 +1539,19 @@ export function PhotoStudio({
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'center',
-            padding: '0.5rem 0.9rem',
+            padding: '0.48rem 0.85rem',
             borderBottom: '1px solid var(--border)',
             background: 'var(--bg-panel)',
-            fontSize: '0.76rem',
+            fontSize: '0.75rem',
+            flexWrap: 'wrap',
+            gap: '0.4rem',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <span style={{ fontWeight: 600 }}>
               {currentRevision
                 ? `${currentRevision.label} (${currentRevision.width}×${currentRevision.height})`
-                : 'Empty Canvas — Load or Generate an Image'}
+                : 'Empty Canvas'}
             </span>
             {hasMask && (
               <span
@@ -1236,18 +1564,17 @@ export function PhotoStudio({
                   fontWeight: 600,
                 }}
               >
-                🖌️ Feathered Mask Active
+                🖌️ Mask Active
               </span>
             )}
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
             <button
               type="button"
               className="chip"
               onClick={() => setActiveRevIndex((i) => Math.max(0, i - 1))}
               disabled={activeRevIndex <= 0}
-              title="Undo (Previous Revision)"
             >
               ↩ Undo
             </button>
@@ -1256,7 +1583,6 @@ export function PhotoStudio({
               className="chip"
               onClick={() => setActiveRevIndex((i) => Math.min(revisions.length - 1, i + 1))}
               disabled={activeRevIndex >= revisions.length - 1}
-              title="Redo (Next Revision)"
             >
               ↪ Redo
             </button>
@@ -1267,9 +1593,8 @@ export function PhotoStudio({
               onMouseUp={() => setCompareOriginal(false)}
               onMouseLeave={() => setCompareOriginal(false)}
               disabled={revisions.length < 2}
-              title="Hold to compare with Original Import"
             >
-              👁️ Hold to Compare Original
+              👁️ Compare Orig
             </button>
             <button
               type="button"
@@ -1278,7 +1603,7 @@ export function PhotoStudio({
             >
               −
             </button>
-            <span style={{ minWidth: 42, textAlign: 'center', fontSize: '0.72rem' }}>
+            <span style={{ minWidth: 40, textAlign: 'center', fontSize: '0.72rem' }}>
               {Math.round(zoom * 100)}%
             </span>
             <button
@@ -1292,17 +1617,35 @@ export function PhotoStudio({
               100%
             </button>
             {currentRevision && (
-              <button
-                type="button"
-                className="btn"
-                style={{ padding: '0.2rem 0.6rem', fontSize: '0.73rem' }}
-                onClick={() =>
-                  onSendToVideoStudio(currentRevision.dataUrl, currentRevision.label)
-                }
-              >
-                🎬 Send to Video Studio
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="chip"
+                  onClick={handlePinCurrentToScratch}
+                  title="Pin current canvas layer to Scratch Space"
+                >
+                  📌 To Scratch
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '0.18rem 0.55rem', fontSize: '0.72rem' }}
+                  onClick={() =>
+                    onSendToVideoStudio(currentRevision.dataUrl, currentRevision.label)
+                  }
+                >
+                  🎬 To Video
+                </button>
+              </>
             )}
+            <button
+              type="button"
+              className={`chip ${rightCopilotOpen ? 'active' : ''}`}
+              onClick={() => setRightCopilotOpen((v) => !v)}
+              title="Toggle AI Copilot Sidebar"
+            >
+              🤖 {rightCopilotOpen ? 'Hide Copilot »' : '« AI Copilot'}
+            </button>
           </div>
         </div>
 
@@ -1313,7 +1656,7 @@ export function PhotoStudio({
               background: 'rgba(99, 102, 241, 0.16)',
               borderBottom: '1px solid rgba(99, 102, 241, 0.35)',
               color: '#c7d2fe',
-              fontSize: '0.76rem',
+              fontSize: '0.75rem',
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
@@ -1338,7 +1681,7 @@ export function PhotoStudio({
           </div>
         )}
 
-        {/* Canvas Viewport + Optional 3D Material Studio Split View */}
+        {/* Canvas Viewport */}
         <div
           style={{
             flex: 1,
@@ -1352,7 +1695,7 @@ export function PhotoStudio({
           }}
         >
           {active3DModel && (
-            <div style={{ width: '100%', maxWidth: 760 }}>
+            <div style={{ width: '100%', maxWidth: 820 }}>
               <div
                 style={{
                   display: 'flex',
@@ -1363,24 +1706,26 @@ export function PhotoStudio({
                 }}
               >
                 <span style={{ fontWeight: 700, color: '#a5b4fc' }}>
-                  🧊 Interactive 3D Material & Render Studio ({active3DModel.filename})
+                  🧊 Interactive 3D Material &amp; Render Studio ({active3DModel.filename})
                 </span>
-                <button
-                  type="button"
-                  className="chip"
-                  onClick={() => setActive3DModel(null)}
-                >
+                <button type="button" className="chip" onClick={() => setActive3DModel(null)}>
                   Hide 3D Viewer
                 </button>
               </div>
               <Model3DViewer
                 url={active3DModel.url}
                 filename={active3DModel.filename}
-                height={320}
+                height={330}
                 textureCandidateUrl={secondImageB64 || currentRevision?.dataUrl || null}
                 onCaptureRenderToCanvas={(dataUrl, label) => {
                   pushRevision(dataUrl, label)
-                  setStatusBanner('Captured 3D Render onto Photo Studio canvas!')
+                  onAddScratchItem({
+                    kind: 'image',
+                    label,
+                    url: dataUrl,
+                    metaText: '3D Snapshot',
+                  })
+                  setStatusBanner('Captured 3D Render onto Canvas & Scratch Space!')
                 }}
               />
             </div>
@@ -1404,7 +1749,7 @@ export function PhotoStudio({
             >
               <canvas
                 ref={baseCanvasRef}
-                style={{ display: 'block', maxWidth: '68vw', maxHeight: '62vh' }}
+                style={{ display: 'block', maxWidth: '78vw', maxHeight: '68vh' }}
               />
               <canvas
                 ref={maskCanvasRef}
@@ -1423,8 +1768,7 @@ export function PhotoStudio({
                   width: '100%',
                   height: '100%',
                   opacity: showMaskOverlay ? 1 : 0,
-                  cursor:
-                    activeTool === 'brush' || activeTool === 'eraser' ? 'crosshair' : 'default',
+                  cursor: brushMode === 'pan' ? 'grab' : 'crosshair',
                 }}
               />
             </div>
@@ -1444,16 +1788,25 @@ export function PhotoStudio({
                 No Photo Loaded Yet
               </div>
               <div style={{ fontSize: '0.8rem', marginBottom: '1rem', lineHeight: 1.5 }}>
-                Click <strong>Open Photo</strong> on the left, pick a recent generation, or ask the
-                AI Copilot on the right to generate a brand-new image!
+                Open a photo from disk, pick from Scratch Space (`🗂️`), or ask the AI Copilot on
+                the right to generate a brand-new image!
               </div>
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                📂 Open Photo from Disk
-              </button>
+              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center' }}>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  📂 Open Photo
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => selectToolset('media')}
+                >
+                  Browse Recent Generations
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -1463,24 +1816,24 @@ export function PhotoStudio({
           style={{
             borderTop: '1px solid var(--border)',
             background: 'var(--bg-panel)',
-            padding: '0.5rem 0.9rem',
+            padding: '0.45rem 0.85rem',
             display: 'flex',
             alignItems: 'center',
-            gap: '0.6rem',
+            gap: '0.55rem',
             overflowX: 'auto',
-            minHeight: 74,
+            minHeight: 68,
           }}
         >
           <span
             style={{
-              fontSize: '0.72rem',
+              fontSize: '0.7rem',
               fontWeight: 700,
               color: 'var(--text-muted)',
               textTransform: 'uppercase',
               flexShrink: 0,
             }}
           >
-            Revisions ({revisions.length}):
+            History ({revisions.length}):
           </span>
           {revisions.map((rev, idx) => (
             <div
@@ -1490,13 +1843,11 @@ export function PhotoStudio({
                 display: 'flex',
                 alignItems: 'center',
                 gap: 6,
-                padding: '0.25rem 0.45rem',
+                padding: '0.2rem 0.45rem',
                 borderRadius: 8,
                 cursor: 'pointer',
                 border:
-                  idx === activeRevIndex
-                    ? '2px solid #6366f1'
-                    : '1px solid var(--border)',
+                  idx === activeRevIndex ? '2px solid #6366f1' : '1px solid var(--border)',
                 background:
                   idx === activeRevIndex ? 'rgba(99, 102, 241, 0.16)' : 'rgba(15, 23, 42, 0.6)',
                 flexShrink: 0,
@@ -1505,9 +1856,9 @@ export function PhotoStudio({
               <img
                 src={rev.dataUrl}
                 alt={rev.label}
-                style={{ width: 38, height: 38, objectFit: 'cover', borderRadius: 4 }}
+                style={{ width: 34, height: 34, objectFit: 'cover', borderRadius: 4 }}
               />
-              <div style={{ fontSize: '0.7rem', maxWidth: 115 }}>
+              <div style={{ fontSize: '0.68rem', maxWidth: 110 }}>
                 <div
                   style={{
                     fontWeight: 600,
@@ -1518,7 +1869,7 @@ export function PhotoStudio({
                 >
                   {idx + 1}. {rev.label}
                 </div>
-                <div style={{ color: 'var(--text-muted)', fontSize: '0.65rem' }}>
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
                   {rev.width}×{rev.height}
                 </div>
               </div>
@@ -1527,245 +1878,250 @@ export function PhotoStudio({
         </div>
       </main>
 
-      {/* RIGHT PANEL: AI Copilot Chat & Automatic Model Router */}
-      <aside
-        style={{
-          borderLeft: '1px solid var(--border)',
-          background: 'var(--bg-panel)',
-          display: 'flex',
-          flexDirection: 'column',
-          overflow: 'hidden',
-        }}
-      >
-        {/* Header & Mode Switch */}
-        <div
+      {/* MINIMIZABLE RIGHT PANEL: AI Copilot Chat & Automatic Model Router */}
+      {rightCopilotOpen && (
+        <aside
           style={{
-            padding: '0.75rem 0.85rem',
-            borderBottom: '1px solid var(--border)',
+            width: 340,
+            flexShrink: 0,
+            borderLeft: '1px solid var(--border)',
+            background: 'var(--bg-panel)',
             display: 'flex',
             flexDirection: 'column',
-            gap: '0.45rem',
+            overflow: 'hidden',
           }}
         >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <div style={{ fontWeight: 700, fontSize: '0.86rem' }}>🤖 Lemonade AI Copilot</div>
-            <span
-              style={{
-                fontSize: '0.68rem',
-                padding: '0.12rem 0.45rem',
-                borderRadius: 999,
-                background: assistantOnline
-                  ? 'rgba(16, 185, 129, 0.16)'
-                  : 'rgba(245, 158, 11, 0.16)',
-                color: assistantOnline ? '#34d399' : '#fbbf24',
-              }}
-            >
-              {assistantOnline ? '🟢 Lemonade Online' : '🟡 Local Router'}
-            </span>
-          </div>
           <div
             style={{
+              padding: '0.7rem 0.8rem',
+              borderBottom: '1px solid var(--border)',
               display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              fontSize: '0.72rem',
-              color: 'var(--text-muted)',
+              flexDirection: 'column',
+              gap: '0.45rem',
             }}
           >
-            <span title={assistantModel} style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              Model: {assistantModel}
-            </span>
-            <div style={{ display: 'flex', gap: 4 }}>
-              <button
-                type="button"
-                className={`chip ${autoPilot ? 'active' : ''}`}
-                style={{ padding: '0.12rem 0.45rem', fontSize: '0.68rem' }}
-                onClick={() => setAutoPilot(true)}
-                title="Automatically execute the best ComfyUI workflow immediately"
-              >
-                ⚡ Auto-Pilot
-              </button>
-              <button
-                type="button"
-                className={`chip ${!autoPilot ? 'active' : ''}`}
-                style={{ padding: '0.12rem 0.45rem', fontSize: '0.68rem' }}
-                onClick={() => setAutoPilot(false)}
-                title="Preview the selected template and prompt before running"
-              >
-                🧭 Review
-              </button>
-            </div>
-          </div>
-
-          {/* 1-Click Quick Action Chips */}
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', marginTop: 2 }}>
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.16rem 0.45rem' }}
-              onClick={() =>
-                handleSendChat(
-                  'Isolate the main character in the foreground and remove the background cleanly',
-                )
-              }
-            >
-              🧍 Isolate Character
-            </button>
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.16rem 0.45rem' }}
-              onClick={() =>
-                handleSendChat(
-                  'Isolate the central group of characters and remove the background',
-                )
-              }
-            >
-              👥 Isolate Group
-            </button>
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.16rem 0.45rem' }}
-              onClick={() => handleSendChat('Remove the background and output a clean PNG')}
-            >
-              ✂️ Remove BG
-            </button>
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.16rem 0.45rem' }}
-              onClick={() =>
-                handleSendChat('Convert this subject into a textured 3D model and render it')
-              }
-            >
-              🧊 3D + Texture
-            </button>
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.16rem 0.45rem' }}
-              onClick={() =>
-                handleSendChat(
-                  'Enhance lighting, skin texture, and cinematic clarity while preserving the subject',
-                )
-              }
-            >
-              ✨ Enhance
-            </button>
-            <button
-              type="button"
-              className="chip"
-              style={{ fontSize: '0.68rem', padding: '0.16rem 0.45rem' }}
-              onClick={() =>
-                handleSendChat('Animate this photo with subtle natural motion and cinematic camera pan')
-              }
-            >
-              🎬 Animate
-            </button>
-          </div>
-        </div>
-
-        {/* Chat Message History */}
-        <div
-          style={{
-            flex: 1,
-            overflowY: 'auto',
-            padding: '0.75rem',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '0.65rem',
-          }}
-        >
-          {chatTurns.map((turn) => (
-            <div
-              key={turn.id}
-              style={{
-                alignSelf: turn.role === 'user' ? 'flex-end' : 'flex-start',
-                maxWidth: '92%',
-                padding: '0.55rem 0.7rem',
-                borderRadius: 10,
-                fontSize: '0.78rem',
-                lineHeight: 1.45,
-                background:
-                  turn.role === 'user' ? 'rgba(99, 102, 241, 0.25)' : 'rgba(15, 23, 42, 0.85)',
-                border: '1px solid var(--border)',
-              }}
-            >
-              <div>{turn.text}</div>
-              {turn.plan && turn.plan.action === 'execute' && turn.plan.template_id && (
-                <div
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontWeight: 700, fontSize: '0.84rem' }}>🤖 Lemonade AI Copilot</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span
                   style={{
-                    marginTop: '0.45rem',
-                    padding: '0.45rem 0.55rem',
-                    borderRadius: 6,
-                    background: 'rgba(30, 41, 59, 0.8)',
-                    border: '1px solid rgba(99, 102, 241, 0.35)',
-                    fontSize: '0.71rem',
+                    fontSize: '0.66rem',
+                    padding: '0.1rem 0.4rem',
+                    borderRadius: 999,
+                    background: assistantOnline
+                      ? 'rgba(16, 185, 129, 0.16)'
+                      : 'rgba(245, 158, 11, 0.16)',
+                    color: assistantOnline ? '#34d399' : '#fbbf24',
                   }}
                 >
-                  <div style={{ fontWeight: 700, color: '#a5b4fc' }}>
-                    🎯 Template: {turn.plan.template_id}
-                  </div>
-                  <div style={{ color: 'var(--text-muted)', marginTop: 2 }}>
-                    Prompt: &ldquo;{turn.plan.prompt}&rdquo;
-                  </div>
-                  {!turn.runId && (
-                    <button
-                      type="button"
-                      className="btn btn-primary"
-                      style={{ marginTop: 6, padding: '0.2rem 0.6rem', fontSize: '0.7rem' }}
-                      onClick={() => handleExecutePlanCard(turn.plan!)}
-                    >
-                      ▶ Run Workflow Now
-                    </button>
-                  )}
-                </div>
-              )}
+                  {assistantOnline ? '🟢 Online' : '🟡 Local'}
+                </span>
+                <button
+                  type="button"
+                  className="chip"
+                  style={{ padding: '0.1rem 0.4rem', fontSize: '0.68rem' }}
+                  onClick={() => setRightCopilotOpen(false)}
+                  title="Minimize Copilot Sidebar"
+                >
+                  »
+                </button>
+              </div>
             </div>
-          ))}
-          {chatBusy && (
-            <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
-              🤖 Lemonade AI is selecting the optimal ComfyUI workflow...
-            </div>
-          )}
-        </div>
 
-        {/* Chat Input Box */}
-        <form
-          onSubmit={(e) => {
-            e.preventDefault()
-            handleSendChat()
-          }}
-          style={{
-            padding: '0.65rem',
-            borderTop: '1px solid var(--border)',
-            display: 'flex',
-            gap: '0.4rem',
-          }}
-        >
-          <input
-            type="text"
-            className="search-input"
-            placeholder={
-              hasMask
-                ? 'Describe what to put in the painted mask...'
-                : 'Ask Copilot to edit, isolate, make 3D, or generate...'
-            }
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            style={{ flex: 1, fontSize: '0.78rem' }}
-          />
-          <button
-            type="submit"
-            className="btn btn-primary"
-            disabled={chatBusy || !chatInput.trim()}
-            style={{ fontSize: '0.78rem', padding: '0.4rem 0.75rem' }}
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                fontSize: '0.7rem',
+                color: 'var(--text-muted)',
+              }}
+            >
+              <span
+                title={assistantModel}
+                style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+              >
+                {assistantModel}
+              </span>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <button
+                  type="button"
+                  className={`chip ${autoPilot ? 'active' : ''}`}
+                  style={{ padding: '0.1rem 0.4rem', fontSize: '0.66rem' }}
+                  onClick={() => setAutoPilot(true)}
+                >
+                  ⚡ Auto
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${!autoPilot ? 'active' : ''}`}
+                  style={{ padding: '0.1rem 0.4rem', fontSize: '0.66rem' }}
+                  onClick={() => setAutoPilot(false)}
+                >
+                  🧭 Review
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.28rem' }}>
+              <button
+                type="button"
+                className="chip"
+                style={{ fontSize: '0.66rem', padding: '0.14rem 0.42rem' }}
+                onClick={() =>
+                  handleSendChat(
+                    'Isolate the main character in the foreground and remove the background cleanly',
+                  )
+                }
+              >
+                🧍 Isolate Character
+              </button>
+              <button
+                type="button"
+                className="chip"
+                style={{ fontSize: '0.66rem', padding: '0.14rem 0.42rem' }}
+                onClick={() =>
+                  handleSendChat(
+                    'Isolate the central group of characters and remove the background',
+                  )
+                }
+              >
+                👥 Isolate Group
+              </button>
+              <button
+                type="button"
+                className="chip"
+                style={{ fontSize: '0.66rem', padding: '0.14rem 0.42rem' }}
+                onClick={() => handleSendChat('Remove the background and output a clean PNG')}
+              >
+                ✂️ Remove BG
+              </button>
+              <button
+                type="button"
+                className="chip"
+                style={{ fontSize: '0.66rem', padding: '0.14rem 0.42rem' }}
+                onClick={() =>
+                  handleSendChat('Convert this subject into a textured 3D model and render it')
+                }
+              >
+                🧊 3D + Texture
+              </button>
+              <button
+                type="button"
+                className="chip"
+                style={{ fontSize: '0.66rem', padding: '0.14rem 0.42rem' }}
+                onClick={() =>
+                  handleSendChat(
+                    'Enhance lighting, skin texture, and cinematic clarity while preserving the subject',
+                  )
+                }
+              >
+                ✨ Enhance
+              </button>
+            </div>
+          </div>
+
+          <div
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '0.7rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.6rem',
+            }}
           >
-            Send
-          </button>
-        </form>
-      </aside>
+            {chatTurns.map((turn) => (
+              <div
+                key={turn.id}
+                style={{
+                  alignSelf: turn.role === 'user' ? 'flex-end' : 'flex-start',
+                  maxWidth: '92%',
+                  padding: '0.5rem 0.65rem',
+                  borderRadius: 10,
+                  fontSize: '0.76rem',
+                  lineHeight: 1.45,
+                  background:
+                    turn.role === 'user'
+                      ? 'rgba(99, 102, 241, 0.25)'
+                      : 'rgba(15, 23, 42, 0.85)',
+                  border: '1px solid var(--border)',
+                }}
+              >
+                <div>{turn.text}</div>
+                {turn.plan && turn.plan.action === 'execute' && turn.plan.template_id && (
+                  <div
+                    style={{
+                      marginTop: '0.4rem',
+                      padding: '0.4rem 0.5rem',
+                      borderRadius: 6,
+                      background: 'rgba(30, 41, 59, 0.8)',
+                      border: '1px solid rgba(99, 102, 241, 0.35)',
+                      fontSize: '0.7rem',
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, color: '#a5b4fc' }}>
+                      🎯 {turn.plan.template_id}
+                    </div>
+                    <div style={{ color: 'var(--text-muted)', marginTop: 2 }}>
+                      &ldquo;{turn.plan.prompt}&rdquo;
+                    </div>
+                    {!turn.runId && (
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        style={{ marginTop: 6, padding: '0.18rem 0.55rem', fontSize: '0.68rem' }}
+                        onClick={() => handleExecutePlanCard(turn.plan!)}
+                      >
+                        ▶ Run Workflow Now
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            {chatBusy && (
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                🤖 Selecting optimal ComfyUI workflow...
+              </div>
+            )}
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              handleSendChat()
+            }}
+            style={{
+              padding: '0.6rem',
+              borderTop: '1px solid var(--border)',
+              display: 'flex',
+              gap: '0.35rem',
+            }}
+          >
+            <input
+              type="text"
+              className="search-input"
+              placeholder={
+                hasMask
+                  ? 'Describe what to put in painted mask...'
+                  : 'Ask Copilot to edit, isolate, make 3D...'
+              }
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              style={{ flex: 1, fontSize: '0.76rem' }}
+            />
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={chatBusy || !chatInput.trim()}
+              style={{ fontSize: '0.76rem', padding: '0.38rem 0.7rem' }}
+            >
+              Send
+            </button>
+          </form>
+        </aside>
+      )}
     </div>
   )
 }

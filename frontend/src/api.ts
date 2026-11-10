@@ -167,7 +167,20 @@ export interface VideoMetadata {
 export interface VideoFilmstripFrame {
   index: number
   timestamp: number
+  frame_number?: number
   data_url: string
+}
+
+export interface ScratchItem {
+  id: string
+  kind: 'image' | 'video' | '3d'
+  label: string
+  url: string
+  filename?: string
+  subfolder?: string
+  type?: string
+  metaText?: string
+  createdAt: number
 }
 
 export function formatBytes(bytes: number | null | undefined): string {

@@ -29,6 +29,7 @@ class TrimVideoRequest(BaseModel):
     type: str = "output"
     start_sec: float = 0.0
     end_sec: float
+    mode: str = "keep_range"  # "keep_range" | "remove_range"
 
 
 class VideoClipItem(BaseModel):
@@ -160,11 +161,12 @@ def create_video_router(comfy_client: ComfyUIClient) -> APIRouter:
         filename: str = Query(...),
         subfolder: str = Query(""),
         type: str = Query("output"),
-        count: int = Query(8, ge=2, le=16),
+        count: int = Query(12, ge=2, le=24),
     ) -> dict[str, Any]:
         video_path = await _resolve_video_path(filename, subfolder, type)
         meta = await asyncio.to_thread(_probe_video_sync, video_path)
         duration = max(0.1, float(meta.get("duration") or 1.0))
+        fps = float(meta.get("fps") or 24.0)
 
         tmp_dir = settings.data_dir / "filmstrips" / uuid.uuid4().hex[:10]
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +185,7 @@ def create_video_router(comfy_client: ComfyUIClient) -> APIRouter:
                     "-frames:v",
                     "1",
                     "-vf",
-                    "scale=200:-1",
+                    "scale=220:-1",
                     "-q:v",
                     "5",
                     str(out_jpg),
@@ -201,6 +203,7 @@ def create_video_router(comfy_client: ComfyUIClient) -> APIRouter:
                         {
                             "index": i,
                             "timestamp": ts,
+                            "frame_number": max(0, int(round(ts * fps))),
                             "data_url": f"data:image/jpeg;base64,{b64}",
                         }
                     )
@@ -299,41 +302,146 @@ def create_video_router(comfy_client: ComfyUIClient) -> APIRouter:
         if req.end_sec <= req.start_sec:
             raise HTTPException(status_code=400, detail="end_sec must be greater than start_sec")
         video_path = await _resolve_video_path(req.filename, req.subfolder, req.type)
+        orig_meta = await asyncio.to_thread(_probe_video_sync, video_path)
+        total_dur = float(orig_meta.get("duration") or 0.0)
 
-        out_name = f"trimmed_{Path(req.filename).stem}_{uuid.uuid4().hex[:6]}.mp4"
+        prefix = "spliced" if req.mode == "remove_range" else "trimmed"
+        out_name = f"{prefix}_{Path(req.filename).stem}_{uuid.uuid4().hex[:6]}.mp4"
         stitched_dir = settings.data_dir / "stitched_outputs"
         stitched_dir.mkdir(parents=True, exist_ok=True)
         out_path = stitched_dir / out_name
 
-        duration = req.end_sec - req.start_sec
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(max(0.0, req.start_sec)),
-            "-i",
-            str(video_path),
-            "-t",
-            str(duration),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            str(out_path),
-        ]
-        await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        if req.mode == "remove_range":
+            # Keep [0, start_sec] + [end_sec, total_dur]
+            tmp_dir = settings.data_dir / "segments" / f"rm_{uuid.uuid4().hex[:8]}"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            parts: list[Path] = []
+            try:
+                if req.start_sec > 0.08:
+                    p1 = tmp_dir / "part1.mp4"
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-ss",
+                            "0",
+                            "-i",
+                            str(video_path),
+                            "-t",
+                            str(req.start_sec),
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "fast",
+                            "-crf",
+                            "18",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-an",
+                            str(p1),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                    if p1.is_file():
+                        parts.append(p1)
+                if total_dur - req.end_sec > 0.08:
+                    p2 = tmp_dir / "part2.mp4"
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-ss",
+                            str(req.end_sec),
+                            "-i",
+                            str(video_path),
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "fast",
+                            "-crf",
+                            "18",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-an",
+                            str(p2),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+                    if p2.is_file():
+                        parts.append(p2)
+                if not parts:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cannot remove entire video duration; leave frames before In or after Out.",
+                    )
+                if len(parts) == 1:
+                    out_path.write_bytes(parts[0].read_bytes())
+                else:
+                    concat_txt = tmp_dir / "concat.txt"
+                    concat_txt.write_text(
+                        "\n".join(f"file '{p.resolve().as_posix()}'" for p in parts) + "\n",
+                        encoding="utf-8",
+                    )
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-f",
+                            "concat",
+                            "-safe",
+                            "0",
+                            "-i",
+                            str(concat_txt),
+                            "-c",
+                            "copy",
+                            str(out_path),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                    )
+            finally:
+                for f in tmp_dir.glob("*"):
+                    f.unlink(missing_ok=True)
+                tmp_dir.rmdir()
+        else:
+            duration = req.end_sec - req.start_sec
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                str(max(0.0, req.start_sec)),
+                "-i",
+                str(video_path),
+                "-t",
+                str(duration),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(out_path),
+            ]
+            await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
         # Also stage into ComfyUI input dir so workflows can use the trimmed video immediately
         settings.comfyui_input_dir.mkdir(parents=True, exist_ok=True)
         (settings.comfyui_input_dir / out_name).write_bytes(out_path.read_bytes())

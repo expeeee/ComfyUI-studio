@@ -4,6 +4,7 @@ import {
   ExtractedParameter,
   formatBytes,
   RunRecord,
+  ScratchItem,
   SettingsInfo,
   TemplateDetailResponse,
   TemplateSummary,
@@ -15,8 +16,44 @@ import { VideoStudio } from './VideoStudio'
 
 export function App() {
   const [studioMode, setStudioMode] = useState<'templates' | 'photo' | 'video'>('templates')
+  const [leftCatalogOpen, setLeftCatalogOpen] = useState<boolean>(true)
   const [photoInitialImage, setPhotoInitialImage] = useState<{ url: string; label: string } | null>(null)
   const [videoIncomingImage, setVideoIncomingImage] = useState<{ url: string; label: string } | null>(null)
+  const [scratchItems, setScratchItems] = useState<ScratchItem[]>(() => {
+    try {
+      const raw = localStorage.getItem('comfyui_studio_scratch_v1')
+      return raw ? JSON.parse(raw) : []
+    } catch {
+      return []
+    }
+  })
+
+  const handleAddScratchItem = (item: Omit<ScratchItem, 'id' | 'createdAt'>) => {
+    setScratchItems((prev) => {
+      const next: ScratchItem[] = [
+        {
+          ...item,
+          id: `scr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          createdAt: Date.now(),
+        },
+        ...prev.filter((x) => x.url !== item.url),
+      ].slice(0, 30)
+      try {
+        localStorage.setItem('comfyui_studio_scratch_v1', JSON.stringify(next))
+      } catch {}
+      return next
+    })
+  }
+
+  const handleRemoveScratchItem = (id: string) => {
+    setScratchItems((prev) => {
+      const next = prev.filter((x) => x.id !== id)
+      try {
+        localStorage.setItem('comfyui_studio_scratch_v1', JSON.stringify(next))
+      } catch {}
+      return next
+    })
+  }
   const [health, setHealth] = useState<any>(null)
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [categories, setCategories] = useState<string[]>([])
@@ -839,6 +876,14 @@ export function App() {
           </div>
         </div>
         <div className="status-pills">
+          <div
+            className="pill"
+            style={{ cursor: 'pointer' }}
+            onClick={() => setStudioMode(studioMode === 'templates' ? 'photo' : studioMode)}
+            title="Shared Scratch Space items across Photo & Video Studio"
+          >
+            <span>🗂️ Scratch Space: {scratchItems.length}</span>
+          </div>
           <div className="pill">
             <span className={`dot ${health?.comfyui_online ? 'online' : 'offline'}`} />
             <span>
@@ -863,6 +908,9 @@ export function App() {
       {studioMode === 'photo' ? (
         <PhotoStudio
           runs={runs}
+          scratchItems={scratchItems}
+          onAddScratchItem={handleAddScratchItem}
+          onRemoveScratchItem={handleRemoveScratchItem}
           initialImageUrl={photoInitialImage?.url || null}
           initialImageLabel={photoInitialImage?.label || null}
           onSendToVideoStudio={(imageUrl, label) => {
@@ -874,6 +922,9 @@ export function App() {
       ) : studioMode === 'video' ? (
         <VideoStudio
           runs={runs}
+          scratchItems={scratchItems}
+          onAddScratchItem={handleAddScratchItem}
+          onRemoveScratchItem={handleRemoveScratchItem}
           defaultSegmentSeconds={settingsInfo?.default_segment_seconds || 10}
           incomingImageForVideo={videoIncomingImage}
           onSendFrameToPhotoStudio={(frameUrl, label) => {
@@ -883,15 +934,65 @@ export function App() {
           onRunsUpdated={refreshRuns}
         />
       ) : (
-        <div className="main-layout">
-        {/* Column 1: Template Catalog */}
+        <div
+          className="main-layout"
+          style={{
+            gridTemplateColumns: leftCatalogOpen ? '340px 1fr 370px' : '48px 1fr 370px',
+          }}
+        >
+        {/* Column 1: Minimizable Template Catalog */}
+        {!leftCatalogOpen ? (
+          <aside
+            className="panel"
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              padding: '0.6rem 0.2rem',
+              gap: '0.6rem',
+            }}
+          >
+            <button
+              type="button"
+              className="chip"
+              onClick={() => setLeftCatalogOpen(true)}
+              title="Expand Template Catalog"
+              style={{ padding: '0.35rem 0.4rem', fontSize: '0.75rem' }}
+            >
+              »
+            </button>
+            <span
+              style={{
+                writingMode: 'vertical-rl',
+                textOrientation: 'mixed',
+                fontSize: '0.75rem',
+                color: 'var(--text-muted)',
+                fontWeight: 600,
+                letterSpacing: '0.06em',
+              }}
+            >
+              TEMPLATE CATALOG ({templates.length})
+            </span>
+          </aside>
+        ) : (
         <aside className="panel">
           <div className="panel-header">
             <div className="panel-title">
               <span>1. Select Template</span>
-              <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                {templates.length} shown
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                  {templates.length} shown
+                </span>
+                <button
+                  type="button"
+                  className="chip"
+                  style={{ padding: '0.1rem 0.45rem', fontSize: '0.7rem' }}
+                  onClick={() => setLeftCatalogOpen(false)}
+                  title="Minimize Template Catalog"
+                >
+                  «
+                </button>
+              </div>
             </div>
             <input
               className="search-input"
@@ -999,6 +1100,7 @@ export function App() {
             ))}
           </div>
         </aside>
+        )}
 
         {/* Column 2: 4-Step Workspace (Install Template -> Download Models -> Prompt & Details -> Generate) */}
         <main className="workspace-scroll">
@@ -1560,6 +1662,27 @@ export function App() {
                         style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}
                         onClick={(e) => e.stopPropagation()}
                       >
+                        {firstOut && firstOut.media_kind !== 'audio' && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '0.74rem' }}
+                            onClick={() =>
+                              handleAddScratchItem({
+                                kind: firstOut.media_kind as 'image' | 'video' | '3d',
+                                label: r.template_title,
+                                url: firstOut.url,
+                                filename: firstOut.filename,
+                                subfolder: firstOut.subfolder,
+                                type: firstOut.type,
+                                metaText: firstOut.media_kind.toUpperCase(),
+                              })
+                            }
+                            title="Pin output to Shared Scratch Space"
+                          >
+                            📌
+                          </button>
+                        )}
                         {firstOut && firstOut.media_kind === 'image' && (
                           <button
                             type="button"
