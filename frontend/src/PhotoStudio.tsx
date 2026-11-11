@@ -8,6 +8,26 @@ import {
 } from './api'
 import { Model3DViewer } from './Model3DViewer'
 
+export interface PhotoLayer {
+  id: string
+  name: string
+  dataUrl: string
+  width: number
+  height: number
+  visible: boolean
+  locked: boolean
+  opacity: number // 0..100
+  blendMode: GlobalCompositeOperation
+  offsetX: number
+  offsetY: number
+  scale: number // 0.1..4.0
+  brightness: number // 40..160 (default 100)
+  contrast: number // 40..160 (default 100)
+  saturation: number // 0..200 (default 100)
+  warmth: number // 0..100 (default 0)
+  blurPx: number // 0..12 (default 0)
+}
+
 export interface CanvasRevision {
   id: string
   label: string
@@ -15,6 +35,8 @@ export interface CanvasRevision {
   width: number
   height: number
   timestamp: number
+  layersSnapshot?: PhotoLayer[]
+  activeLayerIdSnapshot?: string | null
 }
 
 interface ChatTurn {
@@ -25,7 +47,31 @@ interface ChatTurn {
   runId?: string | null
 }
 
-type LeftToolset = 'media' | 'paint' | 'adjust' | '3d' | 'scratch'
+type LeftToolset = 'layers' | 'media' | 'paint' | 'adjust' | '3d' | 'scratch'
+type CanvasToolMode =
+  | 'mask_brush'
+  | 'mask_eraser'
+  | 'box_select'
+  | 'layer_brush'
+  | 'layer_eraser'
+  | 'move_layer'
+
+const BLEND_MODES: Array<{ value: GlobalCompositeOperation; label: string }> = [
+  { value: 'source-over', label: 'Normal' },
+  { value: 'multiply', label: 'Multiply' },
+  { value: 'screen', label: 'Screen' },
+  { value: 'overlay', label: 'Overlay' },
+  { value: 'soft-light', label: 'Soft Light' },
+  { value: 'hard-light', label: 'Hard Light' },
+  { value: 'darken', label: 'Darken' },
+  { value: 'lighten', label: 'Lighten' },
+  { value: 'color-dodge', label: 'Color Dodge' },
+  { value: 'color-burn', label: 'Color Burn' },
+  { value: 'difference', label: 'Difference' },
+  { value: 'exclusion', label: 'Exclusion' },
+  { value: 'luminosity', label: 'Luminosity' },
+  { value: 'color', label: 'Color' },
+]
 
 interface PhotoStudioProps {
   runs: RunRecord[]
@@ -38,14 +84,149 @@ interface PhotoStudioProps {
   onRunsUpdated: () => void
 }
 
+const imageCache = new Map<string, HTMLImageElement>()
+
 async function loadImageElement(src: string): Promise<HTMLImageElement> {
+  const cached = imageCache.get(src)
+  if (cached && cached.complete && cached.naturalWidth > 0) {
+    return cached
+  }
   return new Promise((resolve, reject) => {
     const img = new Image()
     img.crossOrigin = 'anonymous'
-    img.onload = () => resolve(img)
+    img.onload = () => {
+      if (imageCache.size > 80) {
+        const firstKey = imageCache.keys().next().value
+        if (firstKey) imageCache.delete(firstKey)
+      }
+      imageCache.set(src, img)
+      resolve(img)
+    }
     img.onerror = (err) => reject(err)
     img.src = src
   })
+}
+
+function createDefaultLayer(
+  dataUrl: string,
+  name: string,
+  width: number,
+  height: number,
+): PhotoLayer {
+  return {
+    id: `layer-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    name,
+    dataUrl,
+    width,
+    height,
+    visible: true,
+    locked: false,
+    opacity: 100,
+    blendMode: 'source-over',
+    offsetX: 0,
+    offsetY: 0,
+    scale: 1,
+    brightness: 100,
+    contrast: 100,
+    saturation: 100,
+    warmth: 0,
+    blurPx: 0,
+  }
+}
+
+async function renderLayersToDataUrl(
+  layers: PhotoLayer[],
+  docWidth: number,
+  docHeight: number,
+): Promise<string> {
+  const c = document.createElement('canvas')
+  c.width = docWidth
+  c.height = docHeight
+  const ctx = c.getContext('2d')!
+  ctx.clearRect(0, 0, docWidth, docHeight)
+
+  for (const layer of layers) {
+    if (!layer.visible || layer.opacity <= 0) continue
+    try {
+      const img = await loadImageElement(layer.dataUrl)
+      ctx.save()
+      ctx.globalAlpha = Math.max(0, Math.min(1, layer.opacity / 100))
+      ctx.globalCompositeOperation = layer.blendMode || 'source-over'
+      const hasFilter =
+        layer.brightness !== 100 ||
+        layer.contrast !== 100 ||
+        layer.saturation !== 100 ||
+        layer.warmth !== 0 ||
+        layer.blurPx !== 0
+      if (hasFilter) {
+        ctx.filter = `brightness(${layer.brightness}%) contrast(${layer.contrast}%) saturate(${layer.saturation}%) sepia(${layer.warmth}%) blur(${layer.blurPx}px)`
+      }
+      const drawW = layer.width * (layer.scale || 1)
+      const drawH = layer.height * (layer.scale || 1)
+      const dx = (docWidth - drawW) / 2 + (layer.offsetX || 0)
+      const dy = (docHeight - drawH) / 2 + (layer.offsetY || 0)
+      ctx.drawImage(img, dx, dy, drawW, drawH)
+      ctx.restore()
+    } catch {
+      // ignore broken layer
+    }
+  }
+  return c.toDataURL('image/png')
+}
+
+/**
+ * Removes solid corner-sampled background color (e.g. white studio background from Qwen BG removal)
+ * and turns it into true alpha transparency for multi-layer compositing.
+ */
+async function keyOutSolidBackgroundToAlpha(
+  srcDataUrl: string,
+  tolerance = 34,
+): Promise<{ dataUrl: string; width: number; height: number }> {
+  const img = await loadImageElement(srcDataUrl)
+  const w = img.naturalWidth || img.width
+  const h = img.naturalHeight || img.height
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const ctx = c.getContext('2d')!
+  ctx.drawImage(img, 0, 0, w, h)
+  const imgData = ctx.getImageData(0, 0, w, h)
+  const d = imgData.data
+
+  // Sample 4 corners to detect background color
+  const corners = [
+    0,
+    (w - 1) * 4,
+    (h - 1) * w * 4,
+    ((h - 1) * w + (w - 1)) * 4,
+  ]
+  let rBg = 0
+  let gBg = 0
+  let bBg = 0
+  for (const idx of corners) {
+    rBg += d[idx]
+    gBg += d[idx + 1]
+    bBg += d[idx + 2]
+  }
+  rBg = Math.round(rBg / 4)
+  gBg = Math.round(gBg / 4)
+  bBg = Math.round(bBg / 4)
+
+  const softBand = Math.max(12, Math.round(tolerance * 0.6))
+  for (let i = 0; i < d.length; i += 4) {
+    const dr = d[i] - rBg
+    const dg = d[i + 1] - gBg
+    const db = d[i + 2] - bBg
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db)
+    if (dist <= tolerance) {
+      d[i + 3] = 0
+    } else if (dist < tolerance + softBand) {
+      const factor = (dist - tolerance) / softBand
+      d[i + 3] = Math.round(d[i + 3] * factor)
+    }
+  }
+  ctx.putImageData(imgData, 0, 0)
+  return { dataUrl: c.toDataURL('image/png'), width: w, height: h }
 }
 
 async function compositeWithFeatheredMask(
@@ -53,6 +234,7 @@ async function compositeWithFeatheredMask(
   editedImageUrl: string,
   maskCanvas: HTMLCanvasElement,
   featherPx: number,
+  onlyMaskedPatch = false,
 ): Promise<{ dataUrl: string; width: number; height: number }> {
   const [origImg, editImg] = await Promise.all([
     loadImageElement(originalDataUrl),
@@ -79,6 +261,14 @@ async function compositeWithFeatheredMask(
   maskedEditCtx.globalCompositeOperation = 'source-in'
   maskedEditCtx.drawImage(editImg, 0, 0, w, h)
 
+  if (onlyMaskedPatch) {
+    return {
+      dataUrl: maskedEditCanvas.toDataURL('image/png'),
+      width: w,
+      height: h,
+    }
+  }
+
   const outCanvas = document.createElement('canvas')
   outCanvas.width = w
   outCanvas.height = h
@@ -97,6 +287,7 @@ async function extractMaskedSubjectDataUrl(
   baseDataUrl: string,
   maskCanvas: HTMLCanvasElement,
   featherPx: number,
+  transparentBg = false,
 ): Promise<string> {
   const origImg = await loadImageElement(baseDataUrl)
   const w = origImg.naturalWidth || origImg.width
@@ -107,7 +298,7 @@ async function extractMaskedSubjectDataUrl(
   alphaCanvas.height = h
   const alphaCtx = alphaCanvas.getContext('2d')!
   if (featherPx > 0) {
-    alphaCtx.filter = `blur(${Math.max(4, featherPx)}px)`
+    alphaCtx.filter = `blur(${Math.max(2, featherPx)}px)`
   }
   alphaCtx.drawImage(maskCanvas, 0, 0, w, h)
   alphaCtx.filter = 'none'
@@ -119,6 +310,10 @@ async function extractMaskedSubjectDataUrl(
   subjCtx.drawImage(alphaCanvas, 0, 0, w, h)
   subjCtx.globalCompositeOperation = 'source-in'
   subjCtx.drawImage(origImg, 0, 0, w, h)
+
+  if (transparentBg) {
+    return subjCanvas.toDataURL('image/png')
+  }
 
   const finalCanvas = document.createElement('canvas')
   finalCanvas.width = w
@@ -143,32 +338,50 @@ export function PhotoStudio({
   const baseCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const maskCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const addLayerFileInputRef = useRef<HTMLInputElement | null>(null)
   const refImageInputRef = useRef<HTMLInputElement | null>(null)
 
-  // Minimizable Dock & Toolset state
-  const [activeToolset, setActiveToolset] = useState<LeftToolset>('paint')
+  // Minimizable Dock & Toolset state (Default to Patchy Layers toolset)
+  const [activeToolset, setActiveToolset] = useState<LeftToolset>('layers')
   const [leftDrawerOpen, setLeftDrawerOpen] = useState<boolean>(true)
   const [rightCopilotOpen, setRightCopilotOpen] = useState<boolean>(true)
 
+  // Multi-Layer Stack state (Patchy architecture)
+  const [docSize, setDocSize] = useState<{ width: number; height: number }>({
+    width: 1024,
+    height: 1024,
+  })
+  const [layers, setLayers] = useState<PhotoLayer[]>([])
+  const [activeLayerId, setActiveLayerId] = useState<string | null>(null)
+  const [aiOutputMode, setAiOutputMode] = useState<'new_layer' | 'replace_active'>('new_layer')
+  const [aiInputSource, setAiInputSource] = useState<'composite' | 'active_layer'>('composite')
+  const [autoKeyCutoutBg, setAutoKeyCutoutBg] = useState<boolean>(true)
+  const [bgKeyTolerance, setBgKeyTolerance] = useState<number>(34)
+
+  // Undo/Redo Revision History (stores both composited preview & full layer stack snapshot)
   const [revisions, setRevisions] = useState<CanvasRevision[]>([])
   const [activeRevIndex, setActiveRevIndex] = useState<number>(-1)
   const [compareOriginal, setCompareOriginal] = useState(false)
 
-  // Paint & Brush state
-  const [brushMode, setBrushMode] = useState<'brush' | 'eraser' | 'pan'>('brush')
+  // Paint, Mask, Box Select & Move Layer state
+  const [toolMode, setToolMode] = useState<CanvasToolMode>('mask_brush')
   const [brushSize, setBrushSize] = useState(42)
+  const [brushColor, setBrushColor] = useState('#6366f1')
+  const [brushOpacity, setBrushOpacity] = useState(100)
   const [featherPx, setFeatherPx] = useState(12)
   const [hasMask, setHasMask] = useState(false)
   const [showMaskOverlay, setShowMaskOverlay] = useState(true)
   const [zoom, setZoom] = useState(1.0)
   const [isPainting, setIsPainting] = useState(false)
-
-  // GIMP Raster adjustment sliders
-  const [brightness, setBrightness] = useState(100)
-  const [contrast, setContrast] = useState(100)
-  const [saturation, setSaturation] = useState(100)
-  const [warmth, setWarmth] = useState(0)
-  const [blurPx, setBlurPx] = useState(0)
+  const [boxDragStart, setBoxDragStart] = useState<{ x: number; y: number } | null>(null)
+  const [boxDragCurrent, setBoxDragCurrent] = useState<{ x: number; y: number } | null>(null)
+  const moveStartRef = useRef<{
+    mouseX: number
+    mouseY: number
+    origX: number
+    origY: number
+  } | null>(null)
+  const layerPaintCanvasRef = useRef<HTMLCanvasElement | null>(null)
 
   // Optional 2nd Reference / Texture image
   const [secondImageB64, setSecondImageB64] = useState<string | null>(null)
@@ -178,6 +391,7 @@ export function PhotoStudio({
   const [urlImportInput, setUrlImportInput] = useState('')
   const [importingUrl, setImportingUrl] = useState(false)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
+  const [dropAsNewLayer, setDropAsNewLayer] = useState(true)
 
   // Character Isolation & 3D Studio state
   const [isolationTarget, setIsolationTarget] = useState<
@@ -204,49 +418,133 @@ export function PhotoStudio({
     {
       id: 'welcome',
       role: 'assistant',
-      text: 'Welcome to Photo & 3D Studio! Use the left icon rail to switch toolsets or minimize panels. Paint a mask, isolate a character/group, build a textured 3D model, or ask me anything.',
+      text: 'Welcome to the Patchy-powered Photo & 3D Studio! Manage non-destructive layers with blend modes & opacity in the Layers drawer, use Box Select or Feathered Masks to isolate objects onto new layers, or ask me to generate & edit.',
     },
   ])
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const [activePostProcess, setActivePostProcess] = useState<string>('replace_canvas')
   const [statusBanner, setStatusBanner] = useState<string | null>(null)
 
+  const activeLayer = layers.find((l) => l.id === activeLayerId) || layers[layers.length - 1] || null
   const currentRevision =
     activeRevIndex >= 0 && activeRevIndex < revisions.length ? revisions[activeRevIndex] : null
   const originalRevision = revisions.length > 0 ? revisions[0] : null
 
-  const pushRevision = useCallback(
-    async (imageUrlOrDataUrl: string, label: string) => {
-      try {
-        const img = await loadImageElement(imageUrlOrDataUrl)
-        const w = img.naturalWidth || img.width || 1024
-        const h = img.naturalHeight || img.height || 1024
-        const c = document.createElement('canvas')
-        c.width = w
-        c.height = h
-        const ctx = c.getContext('2d')!
-        ctx.drawImage(img, 0, 0, w, h)
-        const dataUrl = c.toDataURL('image/png')
+  // Save a snapshot of the layer stack + composited image to revision history
+  const recordLayerHistory = useCallback(
+    async (
+      nextLayers: PhotoLayer[],
+      nextActiveId: string | null,
+      label: string,
+      widthOverride?: number,
+      heightOverride?: number,
+    ) => {
+      const w = widthOverride || docSize.width || 1024
+      const h = heightOverride || docSize.height || 1024
+      setLayers(nextLayers)
+      setActiveLayerId(nextActiveId)
+      if (widthOverride && heightOverride) {
+        setDocSize({ width: w, height: h })
+      }
+      if (nextLayers.length === 0) return
+      const compositeUrl = await renderLayersToDataUrl(nextLayers, w, h)
+      const rev: CanvasRevision = {
+        id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        label,
+        dataUrl: compositeUrl,
+        width: w,
+        height: h,
+        timestamp: Date.now(),
+        layersSnapshot: nextLayers.map((l) => ({ ...l })),
+        activeLayerIdSnapshot: nextActiveId,
+      }
+      setRevisions((prev) => {
+        const next = [...prev.slice(0, activeRevIndex + 1), rev]
+        setActiveRevIndex(next.length - 1)
+        return next
+      })
+    },
+    [docSize.width, docSize.height, activeRevIndex],
+  )
 
-        const rev: CanvasRevision = {
-          id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          label,
-          dataUrl,
-          width: w,
-          height: h,
-          timestamp: Date.now(),
+  /**
+   * Loads an image onto the canvas:
+   * - If `asNewLayer` is true and layers already exist, adds it as a new layer on top.
+   * - Otherwise initializes/replaces the document with this layer, or updates the active layer.
+   */
+  const pushRevision = useCallback(
+    async (
+      imageUrlOrDataUrl: string,
+      label: string,
+      options?: {
+        mode?: 'auto' | 'new_doc' | 'new_layer' | 'replace_active'
+        keyBackground?: boolean
+      },
+    ) => {
+      try {
+        let finalDataUrl = imageUrlOrDataUrl
+        let w = 1024
+        let h = 1024
+
+        if (options?.keyBackground) {
+          const keyed = await keyOutSolidBackgroundToAlpha(imageUrlOrDataUrl, bgKeyTolerance)
+          finalDataUrl = keyed.dataUrl
+          w = keyed.width
+          h = keyed.height
+        } else {
+          const img = await loadImageElement(imageUrlOrDataUrl)
+          w = img.naturalWidth || img.width || 1024
+          h = img.naturalHeight || img.height || 1024
+          const c = document.createElement('canvas')
+          c.width = w
+          c.height = h
+          const ctx = c.getContext('2d')!
+          ctx.drawImage(img, 0, 0, w, h)
+          finalDataUrl = c.toDataURL('image/png')
         }
-        setRevisions((prev) => {
-          const next = [...prev.slice(0, activeRevIndex + 1), rev]
-          setActiveRevIndex(next.length - 1)
-          return next
-        })
+
+        const effectiveMode =
+          options?.mode === 'auto' || !options?.mode
+            ? layers.length === 0
+              ? 'new_doc'
+              : aiOutputMode
+            : options.mode
+
+        if (effectiveMode === 'new_doc' || layers.length === 0) {
+          const baseLayer = createDefaultLayer(finalDataUrl, label, w, h)
+          await recordLayerHistory([baseLayer], baseLayer.id, label, w, h)
+        } else if (effectiveMode === 'new_layer') {
+          const newLayer = createDefaultLayer(finalDataUrl, label, w, h)
+          const nextLayers = [...layers, newLayer]
+          await recordLayerHistory(nextLayers, newLayer.id, `+ Layer: ${label}`)
+        } else {
+          // replace_active
+          const targetId = activeLayer?.id || layers[layers.length - 1].id
+          const nextLayers = layers.map((l) =>
+            l.id === targetId
+              ? { ...l, name: label, dataUrl: finalDataUrl, width: w, height: h }
+              : l,
+          )
+          await recordLayerHistory(nextLayers, targetId, label)
+        }
       } catch (err) {
-        setStatusBanner(`Failed to load image onto canvas: ${String(err)}`)
+        setStatusBanner(`Failed to load image onto layer stack: ${String(err)}`)
       }
     },
-    [activeRevIndex],
+    [layers, activeLayer, aiOutputMode, bgKeyTolerance, recordLayerHistory],
   )
+
+  // Restore layer stack when stepping through Undo / Redo / History strip
+  const selectRevisionIndex = (idx: number) => {
+    if (idx < 0 || idx >= revisions.length) return
+    const rev = revisions[idx]
+    setActiveRevIndex(idx)
+    if (rev.layersSnapshot && rev.layersSnapshot.length > 0) {
+      setLayers(rev.layersSnapshot.map((l) => ({ ...l })))
+      setActiveLayerId(rev.activeLayerIdSnapshot || rev.layersSnapshot[rev.layersSnapshot.length - 1].id)
+      setDocSize({ width: rev.width, height: rev.height })
+    }
+  }
 
   useEffect(() => {
     fetch('/api/assistant/status')
@@ -260,21 +558,34 @@ export function PhotoStudio({
 
   useEffect(() => {
     if (initialImageUrl) {
-      pushRevision(initialImageUrl, initialImageLabel || 'Imported Frame')
+      pushRevision(initialImageUrl, initialImageLabel || 'Imported Frame', {
+        mode: layers.length > 0 ? 'new_layer' : 'new_doc',
+      })
     }
   }, [initialImageUrl, initialImageLabel])
 
+  // Render live Multi-Layer Stack to baseCanvasRef whenever layers, adjustments, or compareOriginal change
   useEffect(() => {
     const canvas = baseCanvasRef.current
     const maskCanvas = maskCanvasRef.current
-    const targetRev = compareOriginal && originalRevision ? originalRevision : currentRevision
-    if (!canvas || !targetRev) return
+    if (!canvas || layers.length === 0) return
 
     let cancelled = false
-    loadImageElement(targetRev.dataUrl).then((img) => {
-      if (cancelled) return
-      const w = targetRev.width
-      const h = targetRev.height
+
+    const renderStack = async () => {
+      if (compareOriginal && originalRevision) {
+        const origImg = await loadImageElement(originalRevision.dataUrl)
+        if (cancelled) return
+        canvas.width = originalRevision.width
+        canvas.height = originalRevision.height
+        const ctx = canvas.getContext('2d')!
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.drawImage(origImg, 0, 0)
+        return
+      }
+
+      const w = docSize.width
+      const h = docSize.height
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w
         canvas.height = h
@@ -284,26 +595,54 @@ export function PhotoStudio({
         maskCanvas.height = h
         setHasMask(false)
       }
+
+      const loaded = await Promise.all(
+        layers.map(async (layer) => {
+          if (!layer.visible || layer.opacity <= 0) return null
+          try {
+            const img = await loadImageElement(layer.dataUrl)
+            return { layer, img }
+          } catch {
+            return null
+          }
+        }),
+      )
+      if (cancelled) return
+
       const ctx = canvas.getContext('2d')!
       ctx.clearRect(0, 0, w, h)
-      ctx.filter = `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturation}%) sepia(${warmth}%) blur(${blurPx}px)`
-      ctx.drawImage(img, 0, 0, w, h)
-      ctx.filter = 'none'
-    })
+
+      for (const item of loaded) {
+        if (!item) continue
+        const { layer, img } = item
+        ctx.save()
+        ctx.globalAlpha = Math.max(0, Math.min(1, layer.opacity / 100))
+        ctx.globalCompositeOperation = layer.blendMode || 'source-over'
+        const hasFilter =
+          layer.brightness !== 100 ||
+          layer.contrast !== 100 ||
+          layer.saturation !== 100 ||
+          layer.warmth !== 0 ||
+          layer.blurPx !== 0
+        if (hasFilter) {
+          ctx.filter = `brightness(${layer.brightness}%) contrast(${layer.contrast}%) saturate(${layer.saturation}%) sepia(${layer.warmth}%) blur(${layer.blurPx}px)`
+        }
+        const drawW = layer.width * (layer.scale || 1)
+        const drawH = layer.height * (layer.scale || 1)
+        const dx = (w - drawW) / 2 + (layer.offsetX || 0)
+        const dy = (h - drawH) / 2 + (layer.offsetY || 0)
+        ctx.drawImage(img, dx, dy, drawW, drawH)
+        ctx.restore()
+      }
+    }
+
+    renderStack()
     return () => {
       cancelled = true
     }
-  }, [
-    currentRevision,
-    originalRevision,
-    compareOriginal,
-    brightness,
-    contrast,
-    saturation,
-    warmth,
-    blurPx,
-  ])
+  }, [layers, docSize.width, docSize.height, compareOriginal, originalRevision])
 
+  // Poll active ComfyUI run and route result into the Multi-Layer Stack
   useEffect(() => {
     if (!activeRunId) return
     let stopped = false
@@ -336,24 +675,47 @@ export function PhotoStudio({
             setStatusBanner(`3D Mesh ready: ${glbOut.filename}`)
           }
           if (imgOut) {
+            const isBgRemoval =
+              run.template_id?.includes('background_removal') ||
+              run.template_title?.toLowerCase().includes('background') ||
+              run.template_title?.toLowerCase().includes('isolate')
+
             if (
               activePostProcess === 'feathered_mask_composite' &&
               hasMask &&
               currentRevision &&
               maskCanvasRef.current
             ) {
+              const sourceUrl =
+                aiInputSource === 'active_layer' && activeLayer
+                  ? activeLayer.dataUrl
+                  : currentRevision.dataUrl
               const comp = await compositeWithFeatheredMask(
-                currentRevision.dataUrl,
+                sourceUrl,
                 imgOut.url,
                 maskCanvasRef.current,
                 featherPx,
+                aiOutputMode === 'new_layer',
               )
-              await pushRevision(comp.dataUrl, `${run.template_title} (Masked Fill)`)
+              await pushRevision(comp.dataUrl, `${run.template_title} (Masked Patch)`, {
+                mode: aiOutputMode,
+              })
               clearMask()
-              setStatusBanner('Applied Feathered Mask Generative Fill to canvas.')
+              setStatusBanner(
+                aiOutputMode === 'new_layer'
+                  ? 'Added Feathered Mask Generative Fill as a non-destructive Layer!'
+                  : 'Applied Feathered Mask Generative Fill to active layer.',
+              )
             } else {
-              await pushRevision(imgOut.url, run.template_title)
-              setStatusBanner(`Completed: ${run.template_title}`)
+              await pushRevision(imgOut.url, run.template_title, {
+                mode: aiOutputMode,
+                keyBackground: isBgRemoval && autoKeyCutoutBg,
+              })
+              setStatusBanner(
+                isBgRemoval && autoKeyCutoutBg
+                  ? `Isolated subject onto transparent Layer: "${run.template_title}"`
+                  : `Added "${run.template_title}" to Layer Stack`,
+              )
             }
           } else if (vidOut) {
             onAddScratchItem({
@@ -385,6 +747,10 @@ export function PhotoStudio({
     activePostProcess,
     hasMask,
     currentRevision,
+    activeLayer,
+    aiInputSource,
+    aiOutputMode,
+    autoKeyCutoutBg,
     featherPx,
     pushRevision,
     onRunsUpdated,
@@ -401,28 +767,219 @@ export function PhotoStudio({
     }
   }
 
+  // --- LAYER STACK OPERATIONS (Patchy Multi-Layer Controls) ---
+  const updateActiveLayer = (patch: Partial<PhotoLayer>) => {
+    if (!activeLayer) return
+    setLayers((prev) => prev.map((l) => (l.id === activeLayer.id ? { ...l, ...patch } : l)))
+  }
+
+  const updateLayerById = (id: string, patch: Partial<PhotoLayer>) => {
+    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, ...patch } : l)))
+  }
+
+  const handleAddEmptyLayer = async () => {
+    const w = docSize.width || 1024
+    const h = docSize.height || 1024
+    const c = document.createElement('canvas')
+    c.width = w
+    c.height = h
+    const emptyLayer = createDefaultLayer(
+      c.toDataURL('image/png'),
+      `Paint Layer ${layers.length + 1}`,
+      w,
+      h,
+    )
+    const next = [...layers, emptyLayer]
+    await recordLayerHistory(next, emptyLayer.id, `New Empty Layer`)
+    setToolMode('layer_brush')
+    setStatusBanner(`Created transparent "${emptyLayer.name}" and switched to Layer Brush!`)
+  }
+
+  const handleDuplicateActiveLayer = async () => {
+    if (!activeLayer) return
+    const copy: PhotoLayer = {
+      ...activeLayer,
+      id: `layer-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: `${activeLayer.name} Copy`,
+      offsetX: activeLayer.offsetX + 16,
+      offsetY: activeLayer.offsetY + 16,
+    }
+    const idx = layers.findIndex((l) => l.id === activeLayer.id)
+    const next = [...layers.slice(0, idx + 1), copy, ...layers.slice(idx + 1)]
+    await recordLayerHistory(next, copy.id, `Duplicated ${activeLayer.name}`)
+  }
+
+  const handleMoveLayerOrder = async (id: string, direction: 'up' | 'down') => {
+    const idx = layers.findIndex((l) => l.id === id)
+    if (idx === -1) return
+    const targetIdx = direction === 'up' ? idx + 1 : idx - 1
+    if (targetIdx < 0 || targetIdx >= layers.length) return
+    const next = [...layers]
+    const [item] = next.splice(idx, 1)
+    next.splice(targetIdx, 0, item)
+    await recordLayerHistory(next, id, `Reordered ${item.name}`)
+  }
+
+  const handleDeleteLayer = async (id: string) => {
+    if (layers.length <= 1) {
+      setStatusBanner('Cannot delete the only remaining layer.')
+      return
+    }
+    const target = layers.find((l) => l.id === id)
+    const next = layers.filter((l) => l.id !== id)
+    const nextActive = next[next.length - 1]?.id || null
+    await recordLayerHistory(next, nextActive, `Deleted ${target?.name || 'Layer'}`)
+  }
+
+  const handleMergeLayerDown = async () => {
+    if (!activeLayer) return
+    const idx = layers.findIndex((l) => l.id === activeLayer.id)
+    if (idx <= 0) {
+      setStatusBanner('Active layer is already at the bottom of the stack.')
+      return
+    }
+    const bottomLayer = layers[idx - 1]
+    const mergedUrl = await renderLayersToDataUrl(
+      [
+        { ...bottomLayer, visible: true },
+        { ...activeLayer, visible: true },
+      ],
+      docSize.width,
+      docSize.height,
+    )
+    const mergedLayer: PhotoLayer = {
+      ...createDefaultLayer(mergedUrl, `${activeLayer.name} + ${bottomLayer.name}`, docSize.width, docSize.height),
+    }
+    const next = [...layers.slice(0, idx - 1), mergedLayer, ...layers.slice(idx + 1)]
+    await recordLayerHistory(next, mergedLayer.id, `Merged ${activeLayer.name} Down`)
+    setStatusBanner(`Merged "${activeLayer.name}" into "${bottomLayer.name}"`)
+  }
+
+  const handleFlattenAllLayers = async () => {
+    if (layers.length <= 1) return
+    const flatUrl = await renderLayersToDataUrl(layers, docSize.width, docSize.height)
+    const flatLayer = createDefaultLayer(
+      flatUrl,
+      'Flattened Composite',
+      docSize.width,
+      docSize.height,
+    )
+    await recordLayerHistory([flatLayer], flatLayer.id, 'Flattened All Layers')
+    setStatusBanner('Flattened all visible layers into a single layer.')
+  }
+
+  const handleKeyActiveLayerBackground = async () => {
+    if (!activeLayer) return
+    setStatusBanner(`Removing solid background color from "${activeLayer.name}"...`)
+    const keyed = await keyOutSolidBackgroundToAlpha(activeLayer.dataUrl, bgKeyTolerance)
+    const next = layers.map((l) =>
+      l.id === activeLayer.id ? { ...l, dataUrl: keyed.dataUrl } : l,
+    )
+    await recordLayerHistory(next, activeLayer.id, `Keyed Alpha: ${activeLayer.name}`)
+    setStatusBanner(`Converted solid background on "${activeLayer.name}" to transparent alpha!`)
+  }
+
+  const handleExtractMaskToNewLayer = async () => {
+    if (!activeLayer || !hasMask || !maskCanvasRef.current) {
+      setStatusBanner('Paint a mask or drag a Box Selection first to extract onto a new layer.')
+      return
+    }
+    const extractedUrl = await extractMaskedSubjectDataUrl(
+      activeLayer.dataUrl,
+      maskCanvasRef.current,
+      featherPx,
+      true,
+    )
+    const newLayer = createDefaultLayer(
+      extractedUrl,
+      `${activeLayer.name} (Cutout)`,
+      docSize.width,
+      docSize.height,
+    )
+    const next = [...layers, newLayer]
+    await recordLayerHistory(next, newLayer.id, `Extracted Selection Layer`)
+    clearMask()
+    setStatusBanner(`Extracted selection onto new transparent layer "${newLayer.name}"!`)
+  }
+
   const clearMask = () => {
     const mc = maskCanvasRef.current
     if (!mc) return
     const ctx = mc.getContext('2d')!
     ctx.clearRect(0, 0, mc.width, mc.height)
     setHasMask(false)
+    setBoxDragStart(null)
+    setBoxDragCurrent(null)
   }
 
-  const paintAtEvent = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const mc = maskCanvasRef.current
-    if (!mc || brushMode === 'pan') return
+    if (!mc) return { x: 0, y: 0, scaleX: 1, scaleY: 1 }
     const rect = mc.getBoundingClientRect()
     const scaleX = mc.width / (rect.width || 1)
     const scaleY = mc.height / (rect.height || 1)
     const x = (e.clientX - rect.left) * scaleX
     const y = (e.clientY - rect.top) * scaleY
+    return { x, y, scaleX, scaleY }
+  }
 
+  const handleCanvasMouseDown = async (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (layers.length === 0) return
+    const { x, y, scaleX } = getCanvasCoords(e)
+
+    if (toolMode === 'move_layer') {
+      if (!activeLayer || activeLayer.locked) return
+      moveStartRef.current = {
+        mouseX: x,
+        mouseY: y,
+        origX: activeLayer.offsetX || 0,
+        origY: activeLayer.offsetY || 0,
+      }
+      setIsPainting(true)
+      return
+    }
+
+    if (toolMode === 'box_select') {
+      setBoxDragStart({ x, y })
+      setBoxDragCurrent({ x, y })
+      setIsPainting(true)
+      return
+    }
+
+    if (toolMode === 'layer_brush' || toolMode === 'layer_eraser') {
+      if (!activeLayer || activeLayer.locked) {
+        setStatusBanner('Active layer is locked. Unlock it in the Layers panel to paint.')
+        return
+      }
+      const img = await loadImageElement(activeLayer.dataUrl)
+      const c = document.createElement('canvas')
+      c.width = docSize.width
+      c.height = docSize.height
+      const ctx = c.getContext('2d')!
+      const drawW = activeLayer.width * (activeLayer.scale || 1)
+      const drawH = activeLayer.height * (activeLayer.scale || 1)
+      const dx = (docSize.width - drawW) / 2 + (activeLayer.offsetX || 0)
+      const dy = (docSize.height - drawH) / 2 + (activeLayer.offsetY || 0)
+      ctx.drawImage(img, dx, dy, drawW, drawH)
+      layerPaintCanvasRef.current = c
+      setIsPainting(true)
+      paintOnActiveLayerAt(x, y, scaleX)
+      return
+    }
+
+    // Default: mask_brush or mask_eraser
+    setIsPainting(true)
+    paintMaskAt(x, y, scaleX)
+  }
+
+  const paintMaskAt = (x: number, y: number, scaleX: number) => {
+    const mc = maskCanvasRef.current
+    if (!mc) return
     const ctx = mc.getContext('2d')!
     ctx.save()
     ctx.beginPath()
     ctx.arc(x, y, brushSize * scaleX * 0.5, 0, Math.PI * 2)
-    if (brushMode === 'eraser') {
+    if (toolMode === 'mask_eraser') {
       ctx.globalCompositeOperation = 'destination-out'
       ctx.fillStyle = 'rgba(0,0,0,1)'
     } else {
@@ -431,7 +988,108 @@ export function PhotoStudio({
     }
     ctx.fill()
     ctx.restore()
-    if (brushMode === 'brush') setHasMask(true)
+    if (toolMode === 'mask_brush') setHasMask(true)
+  }
+
+  const paintOnActiveLayerAt = (x: number, y: number, scaleX: number) => {
+    const lc = layerPaintCanvasRef.current
+    if (!lc || !activeLayer) return
+    const ctx = lc.getContext('2d')!
+    ctx.save()
+    ctx.beginPath()
+    ctx.arc(x, y, brushSize * scaleX * 0.5, 0, Math.PI * 2)
+    if (toolMode === 'layer_eraser') {
+      ctx.globalCompositeOperation = 'destination-out'
+      ctx.fillStyle = 'rgba(0,0,0,1)'
+    } else {
+      ctx.globalCompositeOperation = 'source-over'
+      ctx.globalAlpha = Math.max(0.05, Math.min(1, brushOpacity / 100))
+      ctx.fillStyle = brushColor
+    }
+    ctx.fill()
+    ctx.restore()
+    const updatedUrl = lc.toDataURL('image/png')
+    updateActiveLayer({
+      dataUrl: updatedUrl,
+      width: docSize.width,
+      height: docSize.height,
+      offsetX: 0,
+      offsetY: 0,
+      scale: 1,
+    })
+  }
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isPainting) return
+    const { x, y, scaleX } = getCanvasCoords(e)
+
+    if (toolMode === 'move_layer' && moveStartRef.current && activeLayer) {
+      const dx = Math.round(x - moveStartRef.current.mouseX)
+      const dy = Math.round(y - moveStartRef.current.mouseY)
+      updateActiveLayer({
+        offsetX: moveStartRef.current.origX + dx,
+        offsetY: moveStartRef.current.origY + dy,
+      })
+      return
+    }
+
+    if (toolMode === 'box_select' && boxDragStart) {
+      setBoxDragCurrent({ x, y })
+      const mc = maskCanvasRef.current
+      if (mc) {
+        const ctx = mc.getContext('2d')!
+        ctx.clearRect(0, 0, mc.width, mc.height)
+        const rx = Math.min(boxDragStart.x, x)
+        const ry = Math.min(boxDragStart.y, y)
+        const rw = Math.abs(x - boxDragStart.x)
+        const rh = Math.abs(y - boxDragStart.y)
+        ctx.fillStyle = 'rgba(244, 63, 94, 0.52)'
+        ctx.fillRect(rx, ry, rw, rh)
+        ctx.strokeStyle = '#ec4899'
+        ctx.lineWidth = 2 * scaleX
+        ctx.strokeRect(rx, ry, rw, rh)
+      }
+      return
+    }
+
+    if (toolMode === 'layer_brush' || toolMode === 'layer_eraser') {
+      paintOnActiveLayerAt(x, y, scaleX)
+      return
+    }
+
+    paintMaskAt(x, y, scaleX)
+  }
+
+  const handleCanvasMouseUp = async () => {
+    if (!isPainting) return
+    setIsPainting(false)
+
+    if (toolMode === 'box_select' && boxDragStart && boxDragCurrent) {
+      const rw = Math.abs(boxDragCurrent.x - boxDragStart.x)
+      const rh = Math.abs(boxDragCurrent.y - boxDragStart.y)
+      if (rw > 8 && rh > 8) {
+        setHasMask(true)
+        setStatusBanner(
+          `Box Selected (${Math.round(rw)}×${Math.round(rh)}px). Click "✂️ Isolate Object in Box" or ask AI Copilot!`,
+        )
+      }
+      setBoxDragStart(null)
+      setBoxDragCurrent(null)
+      return
+    }
+
+    if (
+      (toolMode === 'layer_brush' || toolMode === 'layer_eraser' || toolMode === 'move_layer') &&
+      activeLayer
+    ) {
+      layerPaintCanvasRef.current = null
+      moveStartRef.current = null
+      await recordLayerHistory(
+        layers,
+        activeLayer.id,
+        toolMode === 'move_layer' ? `Moved ${activeLayer.name}` : `Painted ${activeLayer.name}`,
+      )
+    }
   }
 
   const getMaskBoundingBoxHint = (): string | null => {
@@ -463,13 +1121,26 @@ export function PhotoStudio({
     return `center=(${cx}%, ${cy}%), box=[${minX},${minY} to ${maxX},${maxY}] of ${width}x${height}`
   }
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const getEffectiveInputDataUrl = (): string | null => {
+    if (aiInputSource === 'active_layer' && activeLayer) {
+      return activeLayer.dataUrl
+    }
+    const canvas = baseCanvasRef.current
+    if (canvas && layers.length > 0) {
+      return canvas.toDataURL('image/png')
+    }
+    return currentRevision?.dataUrl || null
+  }
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>, forceNewLayer = false) => {
     const file = e.target.files?.[0]
     if (!file) return
     const reader = new FileReader()
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        pushRevision(reader.result, `Loaded: ${file.name}`)
+        pushRevision(reader.result, file.name, {
+          mode: forceNewLayer && layers.length > 0 ? 'new_layer' : 'new_doc',
+        })
         onAddScratchItem({
           kind: 'image',
           label: file.name,
@@ -479,10 +1150,11 @@ export function PhotoStudio({
       }
     }
     reader.readAsDataURL(file)
+    e.target.value = ''
   }
 
   const handleImportFromUrl = useCallback(
-    async (overrideUrl?: string) => {
+    async (overrideUrl?: string, asNewLayer = dropAsNewLayer) => {
       const targetUrl = (overrideUrl ?? urlImportInput).trim()
       if (!targetUrl) return
       setImportingUrl(true)
@@ -498,7 +1170,9 @@ export function PhotoStudio({
         const viewUrl =
           data.url ||
           `/api/view?filename=${encodeURIComponent(data.filename)}&subfolder=${encodeURIComponent(data.subfolder || '')}&type=${encodeURIComponent(data.type || 'input')}`
-        await pushRevision(viewUrl, `URL: ${data.filename}`)
+        await pushRevision(viewUrl, `URL: ${data.filename}`, {
+          mode: asNewLayer && layers.length > 0 ? 'new_layer' : 'new_doc',
+        })
         onAddScratchItem({
           kind: data.media_kind === 'video' ? 'video' : 'image',
           label: data.filename,
@@ -509,14 +1183,14 @@ export function PhotoStudio({
           metaText: 'Imported URL',
         })
         if (!overrideUrl) setUrlImportInput('')
-        setStatusBanner(`Imported "${data.filename}" onto Canvas & Scratch Space!`)
+        setStatusBanner(`Imported "${data.filename}" onto Layer Stack & Scratch Space!`)
       } catch (err) {
         setStatusBanner(`URL Import failed: ${String(err)}`)
       } finally {
         setImportingUrl(false)
       }
     },
-    [urlImportInput, pushRevision, onAddScratchItem],
+    [urlImportInput, dropAsNewLayer, layers.length, pushRevision, onAddScratchItem],
   )
 
   const handleCanvasDrop = async (e: React.DragEvent<HTMLElement>) => {
@@ -524,7 +1198,6 @@ export function PhotoStudio({
     e.stopPropagation()
     setIsDraggingOver(false)
 
-    // 1. Check dropped local file(s) from File Manager
     const files = e.dataTransfer?.files
     if (files && files.length > 0) {
       const file = files[0]
@@ -550,21 +1223,26 @@ export function PhotoStudio({
       const reader = new FileReader()
       reader.onload = () => {
         if (typeof reader.result === 'string') {
-          pushRevision(reader.result, `Dropped: ${file.name}`)
+          pushRevision(reader.result, file.name, {
+            mode: dropAsNewLayer && layers.length > 0 ? 'new_layer' : 'new_doc',
+          })
           onAddScratchItem({
             kind: 'image',
             label: file.name,
             url: reader.result,
             metaText: 'Dropped File',
           })
-          setStatusBanner(`Loaded dropped file "${file.name}"`)
+          setStatusBanner(
+            dropAsNewLayer && layers.length > 0
+              ? `Added dropped file "${file.name}" as a new Layer!`
+              : `Loaded dropped file "${file.name}"`,
+          )
         }
       }
       reader.readAsDataURL(file)
       return
     }
 
-    // 2. Check dropped URL or HTML <img src="..."> from Google Photos / Browser Tab
     const uriList = e.dataTransfer?.getData('text/uri-list') || ''
     const plainText = e.dataTransfer?.getData('text/plain') || ''
     const htmlText = e.dataTransfer?.getData('text/html') || ''
@@ -583,11 +1261,11 @@ export function PhotoStudio({
       }
     }
     if (extractedUrl) {
-      await handleImportFromUrl(extractedUrl)
+      await handleImportFromUrl(extractedUrl, dropAsNewLayer)
     }
   }
 
-  // Support Ctrl+V clipboard paste (image blob or Google Photos / image URL)
+  // Support Ctrl+V clipboard paste (adds as a new Layer when layers exist!)
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
       const activeEl = document.activeElement
@@ -603,8 +1281,10 @@ export function PhotoStudio({
               const reader = new FileReader()
               reader.onload = () => {
                 if (typeof reader.result === 'string') {
-                  pushRevision(reader.result, 'Pasted Clipboard Image')
-                  setStatusBanner('Loaded image from clipboard (Ctrl+V)!')
+                  pushRevision(reader.result, 'Pasted Layer', {
+                    mode: layers.length > 0 ? 'new_layer' : 'new_doc',
+                  })
+                  setStatusBanner('Pasted clipboard image as a new Layer (Ctrl+V)!')
                 }
               }
               reader.readAsDataURL(blob)
@@ -615,12 +1295,12 @@ export function PhotoStudio({
       }
       const pastedText = (e.clipboardData?.getData('text/plain') || '').trim()
       if (pastedText.startsWith('http://') || pastedText.startsWith('https://')) {
-        handleImportFromUrl(pastedText)
+        handleImportFromUrl(pastedText, layers.length > 0)
       }
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [pushRevision, handleImportFromUrl])
+  }, [pushRevision, handleImportFromUrl, layers.length])
 
   const handleSecondImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -637,32 +1317,54 @@ export function PhotoStudio({
 
   const handlePinCurrentToScratch = () => {
     const canvas = baseCanvasRef.current
-    if (!canvas || !currentRevision) return
+    if (!canvas || layers.length === 0) return
     const dataUrl = canvas.toDataURL('image/png')
     onAddScratchItem({
       kind: 'image',
-      label: currentRevision.label,
+      label: `Composite (${layers.length}L)`,
       url: dataUrl,
-      metaText: `${currentRevision.width}×${currentRevision.height}`,
+      metaText: `${docSize.width}×${docSize.height}`,
     })
-    setStatusBanner(`Pinned "${currentRevision.label}" to Scratch Space!`)
+    setStatusBanner(`Pinned composite (${layers.length} layers) to Scratch Space!`)
+  }
+
+  const handlePinLayerToScratch = (layer: PhotoLayer) => {
+    onAddScratchItem({
+      kind: 'image',
+      label: layer.name,
+      url: layer.dataUrl,
+      metaText: `Layer ${layer.width}×${layer.height}`,
+    })
+    setStatusBanner(`Pinned layer "${layer.name}" to Scratch Space!`)
   }
 
   const handleBakeAdjustments = async () => {
-    const canvas = baseCanvasRef.current
-    if (!canvas || !currentRevision) return
-    const bakedDataUrl = canvas.toDataURL('image/png')
-    setBrightness(100)
-    setContrast(100)
-    setSaturation(100)
-    setWarmth(0)
-    setBlurPx(0)
-    await pushRevision(bakedDataUrl, 'Raster Color Adjusted')
+    if (!activeLayer) return
+    const bakedUrl = await renderLayersToDataUrl(
+      [{ ...activeLayer, opacity: 100, blendMode: 'source-over', offsetX: 0, offsetY: 0, scale: 1 }],
+      activeLayer.width,
+      activeLayer.height,
+    )
+    const next = layers.map((l) =>
+      l.id === activeLayer.id
+        ? {
+            ...l,
+            dataUrl: bakedUrl,
+            brightness: 100,
+            contrast: 100,
+            saturation: 100,
+            warmth: 0,
+            blurPx: 0,
+          }
+        : l,
+    )
+    await recordLayerHistory(next, activeLayer.id, `Baked Adjustments (${activeLayer.name})`)
+    setStatusBanner(`Baked color adjustments into layer "${activeLayer.name}".`)
   }
 
   const handleTransform = async (op: 'rot_cw' | 'rot_ccw' | 'flip_h' | 'flip_v') => {
-    if (!currentRevision) return
-    const img = await loadImageElement(currentRevision.dataUrl)
+    if (!activeLayer) return
+    const img = await loadImageElement(activeLayer.dataUrl)
     const w = img.naturalWidth || img.width
     const h = img.naturalHeight || img.height
     const c = document.createElement('canvas')
@@ -681,14 +1383,20 @@ export function PhotoStudio({
       ctx.scale(op === 'flip_h' ? -1 : 1, op === 'flip_v' ? -1 : 1)
       ctx.drawImage(img, 0, 0)
     }
-    await pushRevision(c.toDataURL('image/png'), `Transform (${op})`)
+    const next = layers.map((l) =>
+      l.id === activeLayer.id
+        ? { ...l, dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height }
+        : l,
+    )
+    const newDocW = layers.length === 1 ? c.width : docSize.width
+    const newDocH = layers.length === 1 ? c.height : docSize.height
+    await recordLayerHistory(next, activeLayer.id, `Transform (${op})`, newDocW, newDocH)
   }
 
   const handleAspectCrop = async (ratioW: number, ratioH: number) => {
-    if (!currentRevision) return
-    const img = await loadImageElement(currentRevision.dataUrl)
-    const w = img.naturalWidth || img.width
-    const h = img.naturalHeight || img.height
+    if (layers.length === 0) return
+    const w = docSize.width
+    const h = docSize.height
     const targetRatio = ratioW / ratioH
     const currentRatio = w / h
 
@@ -702,12 +1410,37 @@ export function PhotoStudio({
     const sx = Math.round((w - cropW) / 2)
     const sy = Math.round((h - cropH) / 2)
 
-    const c = document.createElement('canvas')
-    c.width = cropW
-    c.height = cropH
-    const ctx = c.getContext('2d')!
-    ctx.drawImage(img, sx, sy, cropW, cropH, 0, 0, cropW, cropH)
-    await pushRevision(c.toDataURL('image/png'), `Crop ${ratioW}:${ratioH}`)
+    const croppedLayers = await Promise.all(
+      layers.map(async (layer) => {
+        const singleComposite = await renderLayersToDataUrl(
+          [{ ...layer, visible: true, opacity: 100, blendMode: 'source-over' }],
+          w,
+          h,
+        )
+        const img = await loadImageElement(singleComposite)
+        const c = document.createElement('canvas')
+        c.width = cropW
+        c.height = cropH
+        const ctx = c.getContext('2d')!
+        ctx.drawImage(img, sx, sy, cropW, cropH, 0, 0, cropW, cropH)
+        return {
+          ...layer,
+          dataUrl: c.toDataURL('image/png'),
+          width: cropW,
+          height: cropH,
+          offsetX: 0,
+          offsetY: 0,
+          scale: 1,
+        }
+      }),
+    )
+    await recordLayerHistory(
+      croppedLayers,
+      activeLayer?.id || croppedLayers[0].id,
+      `Crop ${ratioW}:${ratioH}`,
+      cropW,
+      cropH,
+    )
   }
 
   const handleExportPNG = () => {
@@ -715,7 +1448,7 @@ export function PhotoStudio({
     if (!canvas) return
     const a = document.createElement('a')
     a.href = canvas.toDataURL('image/png')
-    a.download = `studio_photo_${Date.now()}.png`
+    a.download = `studio_composite_${Date.now()}.png`
     a.click()
   }
 
@@ -736,7 +1469,7 @@ export function PhotoStudio({
       const payload = {
         message: msg,
         history: chatTurns.slice(-4).map((t) => ({ role: t.role, content: t.text })),
-        canvas_image_b64: currentRevision?.dataUrl || null,
+        canvas_image_b64: getEffectiveInputDataUrl(),
         second_image_b64: secondImageB64,
         has_mask: hasMask,
         mask_bbox_hint: getMaskBoundingBoxHint(),
@@ -787,7 +1520,7 @@ export function PhotoStudio({
         body: JSON.stringify({
           template_id: plan.template_id,
           prompt: plan.prompt,
-          canvas_image_b64: currentRevision?.dataUrl || null,
+          canvas_image_b64: getEffectiveInputDataUrl(),
           second_image_b64: secondImageB64,
         }),
       })
@@ -801,18 +1534,23 @@ export function PhotoStudio({
     }
   }
 
-  const handleRunCharacterIsolation = async () => {
-    if (!currentRevision) {
-      setStatusBanner('Load an image onto the canvas first.')
+  const handleRunCharacterIsolation = async (forceMaskMode = false) => {
+    const sourceUrl = getEffectiveInputDataUrl()
+    if (!sourceUrl) {
+      setStatusBanner('Load an image onto the layer stack first.')
       return
     }
-    setStatusBanner('Isolating character/group & removing background via Qwen Image 2.1...')
-    let inputDataUrl = currentRevision.dataUrl
-    if (isolationTarget === 'masked' && hasMask && maskCanvasRef.current) {
+    const targetMode = forceMaskMode ? 'masked' : isolationTarget
+    setStatusBanner(
+      'Isolating character/object via Qwen Image 2.1 & placing onto a transparent Layer...',
+    )
+    let inputDataUrl = sourceUrl
+    if (targetMode === 'masked' && hasMask && maskCanvasRef.current) {
       inputDataUrl = await extractMaskedSubjectDataUrl(
-        currentRevision.dataUrl,
+        sourceUrl,
         maskCanvasRef.current,
         featherPx,
+        false,
       )
     }
     try {
@@ -822,7 +1560,7 @@ export function PhotoStudio({
         body: JSON.stringify({
           canvas_image_b64: inputDataUrl,
           stage: 'isolate_only',
-          isolation_target: isolationTarget,
+          isolation_target: targetMode,
           isolation_prompt: customIsolationPrompt,
           figurine_prepass: figurinePrepass,
         }),
@@ -831,7 +1569,7 @@ export function PhotoStudio({
       if (data.run?.id) {
         setActivePostProcess('replace_canvas')
         setActiveRunId(data.run.id)
-        if (isolationTarget === 'masked') clearMask()
+        if (targetMode === 'masked') clearMask()
       }
     } catch (err) {
       setStatusBanner(`Character isolation failed: ${String(err)}`)
@@ -839,8 +1577,9 @@ export function PhotoStudio({
   }
 
   const handleRun3DPipeline = async () => {
-    if (!currentRevision) {
-      setStatusBanner('Load or isolate a character/object on the canvas first.')
+    const sourceUrl = getEffectiveInputDataUrl()
+    if (!sourceUrl) {
+      setStatusBanner('Load or isolate a character/object on a layer first.')
       return
     }
     setStatusBanner(
@@ -853,8 +1592,8 @@ export function PhotoStudio({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          canvas_image_b64: currentRevision.dataUrl,
-          texture_image_b64: secondImageB64 || currentRevision.dataUrl,
+          canvas_image_b64: sourceUrl,
+          texture_image_b64: secondImageB64 || sourceUrl,
           stage: '3d_and_render',
           apply_texture: apply3DTexture,
           render_mode: render3DMode,
@@ -901,12 +1640,16 @@ export function PhotoStudio({
     .slice(0, 12)
 
   const toolsetButtons: Array<{ id: LeftToolset; icon: string; label: string; badge?: number }> = [
-    { id: 'media', icon: '📂', label: 'Source' },
-    { id: 'paint', icon: '🖌️', label: 'Mask' },
+    { id: 'layers', icon: '📑', label: 'Layers', badge: layers.length || undefined },
+    { id: 'paint', icon: '🖌️', label: 'Tools' },
     { id: 'adjust', icon: '🎛️', label: 'Adjust' },
     { id: '3d', icon: '🧊', label: '3D Studio' },
-    { id: 'scratch', icon: '🗂️', label: 'Scratch', badge: scratchItems.length },
+    { id: 'media', icon: '📂', label: 'Source' },
+    { id: 'scratch', icon: '🗂️', label: 'Scratch', badge: scratchItems.length || undefined },
   ]
+
+  // Display layers in top-to-bottom visual order (top layer first in list, like Patchy & Photoshop)
+  const layersTopDown = [...layers].reverse()
 
   return (
     <div
@@ -923,7 +1666,14 @@ export function PhotoStudio({
         type="file"
         accept="image/*"
         style={{ display: 'none' }}
-        onChange={handleFileUpload}
+        onChange={(e) => handleFileUpload(e, false)}
+      />
+      <input
+        ref={addLayerFileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={(e) => handleFileUpload(e, true)}
       />
       <input
         ref={refImageInputRef}
@@ -964,17 +1714,17 @@ export function PhotoStudio({
                   alignItems: 'center',
                   justifyContent: 'center',
                   gap: 3,
-                  padding: '0.48rem 0.2rem',
+                  padding: '0.46rem 0.2rem',
                   borderRadius: 8,
                   border: isActive ? '1px solid #6366f1' : '1px solid transparent',
                   background: isActive ? 'rgba(99, 102, 241, 0.22)' : 'transparent',
                   color: isActive ? '#e0e7ff' : 'var(--text-muted)',
                   cursor: 'pointer',
-                  fontSize: '0.64rem',
+                  fontSize: '0.63rem',
                   fontWeight: 600,
                 }}
               >
-                <span style={{ fontSize: '1.15rem', lineHeight: 1 }}>{tb.icon}</span>
+                <span style={{ fontSize: '1.12rem', lineHeight: 1 }}>{tb.icon}</span>
                 <span>{tb.label}</span>
                 {tb.badge ? (
                   <span
@@ -1013,7 +1763,7 @@ export function PhotoStudio({
       {leftDrawerOpen && (
         <aside
           style={{
-            width: 285,
+            width: 300,
             flexShrink: 0,
             borderRight: '1px solid var(--border)',
             background: 'var(--bg-panel)',
@@ -1021,7 +1771,7 @@ export function PhotoStudio({
             flexDirection: 'column',
             overflowY: 'auto',
             padding: '0.85rem',
-            gap: '0.85rem',
+            gap: '0.75rem',
           }}
         >
           <div
@@ -1034,10 +1784,11 @@ export function PhotoStudio({
             }}
           >
             <span style={{ fontWeight: 700, fontSize: '0.84rem' }}>
-              {activeToolset === 'media' && '📂 Photo Source & Recent'}
-              {activeToolset === 'paint' && '🖌️ Feathered Mask & Brush'}
-              {activeToolset === 'adjust' && '🎛️ Raster Color & Crop'}
+              {activeToolset === 'layers' && `📑 Patchy Multi-Layer Stack (${layers.length})`}
+              {activeToolset === 'paint' && '🖌️ Paint, Box Select & Move'}
+              {activeToolset === 'adjust' && '🎛️ Non-Destructive Layer Adjust'}
               {activeToolset === '3d' && '🧊 Character & 3D Studio'}
+              {activeToolset === 'media' && '📂 Photo Source & URL Import'}
               {activeToolset === 'scratch' && `🗂️ Scratch Space (${scratchItems.length})`}
             </span>
             <button
@@ -1051,28 +1802,465 @@ export function PhotoStudio({
             </button>
           </div>
 
-          {/* TOOLSET 1: MEDIA & SOURCE */}
-          {activeToolset === 'media' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-              <div style={{ display: 'flex', gap: '0.4rem' }}>
+          {/* TOOLSET 0: PATCHY MULTI-LAYER STACK */}
+          {activeToolset === 'layers' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', fontSize: '0.74rem' }}>
+              {/* Quick Layer Creation Bar */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
                 <button
                   type="button"
                   className="btn btn-primary"
-                  style={{ flex: 1, fontSize: '0.78rem' }}
-                  onClick={() => fileInputRef.current?.click()}
+                  style={{ fontSize: '0.72rem', padding: '0.34rem 0.5rem' }}
+                  onClick={() => addLayerFileInputRef.current?.click()}
                 >
-                  📂 Open Photo
+                  📂 + Image Layer
                 </button>
                 <button
                   type="button"
                   className="btn"
-                  style={{ fontSize: '0.78rem' }}
-                  onClick={handleExportPNG}
-                  disabled={!currentRevision}
+                  style={{ fontSize: '0.72rem', padding: '0.34rem 0.5rem' }}
+                  onClick={handleAddEmptyLayer}
                 >
-                  ⬇ Export PNG
+                  ➕ Empty Layer
                 </button>
               </div>
+
+              {/* Active Layer Blend Mode & Opacity Controls */}
+              {activeLayer && (
+                <div
+                  style={{
+                    padding: '0.55rem',
+                    borderRadius: 8,
+                    background: 'rgba(15, 23, 42, 0.75)',
+                    border: '1px solid rgba(99, 102, 241, 0.35)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6 }}>
+                    <span style={{ color: '#a5b4fc', fontWeight: 700, fontSize: '0.7rem' }}>
+                      BLEND:
+                    </span>
+                    <select
+                      value={activeLayer.blendMode}
+                      onChange={(e) =>
+                        updateActiveLayer({
+                          blendMode: e.target.value as GlobalCompositeOperation,
+                        })
+                      }
+                      style={{
+                        flex: 1,
+                        background: '#0f172a',
+                        color: 'var(--text-main)',
+                        border: '1px solid var(--border)',
+                        borderRadius: 6,
+                        padding: '0.22rem 0.4rem',
+                        fontSize: '0.72rem',
+                      }}
+                    >
+                      {BLEND_MODES.map((bm) => (
+                        <option key={bm.value} value={bm.value}>
+                          {bm.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem', minWidth: 52 }}>
+                      Opacity:
+                    </span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={activeLayer.opacity}
+                      onChange={(e) => updateActiveLayer({ opacity: Number(e.target.value) })}
+                      style={{ flex: 1 }}
+                    />
+                    <span style={{ minWidth: 32, textAlign: 'right', fontSize: '0.7rem' }}>
+                      {activeLayer.opacity}%
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.7rem', minWidth: 52 }}>
+                      Scale:
+                    </span>
+                    <input
+                      type="range"
+                      min={20}
+                      max={250}
+                      value={Math.round((activeLayer.scale || 1) * 100)}
+                      onChange={(e) =>
+                        updateActiveLayer({ scale: Number(e.target.value) / 100 })
+                      }
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{ fontSize: '0.64rem', padding: '0.08rem 0.35rem' }}
+                      onClick={() => updateActiveLayer({ offsetX: 0, offsetY: 0, scale: 1 })}
+                      title="Reset layer position & scale"
+                    >
+                      {Math.round((activeLayer.scale || 1) * 100)}% ↺
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* AI Layer Routing Toggle (Per-Layer AI Generation) */}
+              <div
+                style={{
+                  padding: '0.5rem',
+                  borderRadius: 8,
+                  background: 'rgba(15, 23, 42, 0.55)',
+                  border: '1px solid var(--border)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 5,
+                  fontSize: '0.7rem',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>AI Output Target:</span>
+                  <div style={{ display: 'flex', gap: 3 }}>
+                    <button
+                      type="button"
+                      className={`chip ${aiOutputMode === 'new_layer' ? 'active' : ''}`}
+                      style={{ fontSize: '0.65rem', padding: '0.1rem 0.38rem' }}
+                      onClick={() => setAiOutputMode('new_layer')}
+                    >
+                      ➕ New Layer
+                    </button>
+                    <button
+                      type="button"
+                      className={`chip ${aiOutputMode === 'replace_active' ? 'active' : ''}`}
+                      style={{ fontSize: '0.65rem', padding: '0.1rem 0.38rem' }}
+                      onClick={() => setAiOutputMode('replace_active')}
+                    >
+                      🔄 Active Layer
+                    </button>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>AI Reads From:</span>
+                  <div style={{ display: 'flex', gap: 3 }}>
+                    <button
+                      type="button"
+                      className={`chip ${aiInputSource === 'composite' ? 'active' : ''}`}
+                      style={{ fontSize: '0.65rem', padding: '0.1rem 0.38rem' }}
+                      onClick={() => setAiInputSource('composite')}
+                    >
+                      🥞 Composite
+                    </button>
+                    <button
+                      type="button"
+                      className={`chip ${aiInputSource === 'active_layer' ? 'active' : ''}`}
+                      style={{ fontSize: '0.65rem', padding: '0.1rem 0.38rem' }}
+                      onClick={() => setAiInputSource('active_layer')}
+                    >
+                      📑 Active Only
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Layer Stack List (Top-to-Bottom) */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, maxHeight: 280, overflowY: 'auto' }}>
+                {layersTopDown.length === 0 ? (
+                  <div
+                    style={{
+                      padding: '1rem',
+                      textAlign: 'center',
+                      border: '1px dashed var(--border)',
+                      borderRadius: 8,
+                      color: 'var(--text-muted)',
+                      fontSize: '0.72rem',
+                    }}
+                  >
+                    No layers yet. Drop an image onto the canvas or click <strong>+ Image Layer</strong>.
+                  </div>
+                ) : (
+                  layersTopDown.map((layer) => {
+                    const isSelected = activeLayer?.id === layer.id
+                    return (
+                      <div
+                        key={layer.id}
+                        onClick={() => setActiveLayerId(layer.id)}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          padding: '0.38rem 0.45rem',
+                          borderRadius: 8,
+                          cursor: 'pointer',
+                          border: isSelected
+                            ? '1.5px solid #6366f1'
+                            : '1px solid var(--border)',
+                          background: isSelected
+                            ? 'rgba(99, 102, 241, 0.18)'
+                            : 'rgba(15, 23, 42, 0.65)',
+                        }}
+                      >
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            updateLayerById(layer.id, { visible: !layer.visible })
+                          }}
+                          title={layer.visible ? 'Hide Layer' : 'Show Layer'}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            fontSize: '0.85rem',
+                            opacity: layer.visible ? 1 : 0.35,
+                            padding: 0,
+                          }}
+                        >
+                          👁️
+                        </button>
+                        <div
+                          style={{
+                            width: 36,
+                            height: 36,
+                            borderRadius: 4,
+                            overflow: 'hidden',
+                            border: '1px solid #334155',
+                            flexShrink: 0,
+                            background:
+                              'repeating-conic-gradient(#1e293b 0% 25%, #0f172a 0% 50%) 50% / 10px 10px',
+                          }}
+                        >
+                          <img
+                            src={layer.dataUrl}
+                            alt={layer.name}
+                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                          />
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <input
+                            type="text"
+                            value={layer.name}
+                            onChange={(e) => updateLayerById(layer.id, { name: e.target.value })}
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                              width: '100%',
+                              background: 'transparent',
+                              border: 'none',
+                              color: 'var(--text-main)',
+                              fontWeight: 600,
+                              fontSize: '0.73rem',
+                              outline: 'none',
+                            }}
+                          />
+                          <div style={{ fontSize: '0.63rem', color: 'var(--text-muted)' }}>
+                            {BLEND_MODES.find((b) => b.value === layer.blendMode)?.label || 'Normal'} •{' '}
+                            {layer.opacity}%
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            updateLayerById(layer.id, { locked: !layer.locked })
+                          }}
+                          title={layer.locked ? 'Unlock Layer' : 'Lock Layer'}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            fontSize: '0.76rem',
+                            opacity: layer.locked ? 1 : 0.3,
+                            padding: 0,
+                          }}
+                        >
+                          🔒
+                        </button>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleMoveLayerOrder(layer.id, 'up')
+                            }}
+                            title="Move Layer Up"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              color: 'var(--text-muted)',
+                              cursor: 'pointer',
+                              fontSize: '0.58rem',
+                              lineHeight: 1,
+                              padding: '1px 3px',
+                            }}
+                          >
+                            ▲
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              handleMoveLayerOrder(layer.id, 'down')
+                            }}
+                            title="Move Layer Down"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              color: 'var(--text-muted)',
+                              cursor: 'pointer',
+                              fontSize: '0.58rem',
+                              lineHeight: 1,
+                              padding: '1px 3px',
+                            }}
+                          >
+                            ▼
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+
+              {/* Layer Operations Footer */}
+              {activeLayer && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4 }}>
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{ fontSize: '0.67rem', textAlign: 'center', padding: '0.25rem 0.2rem' }}
+                      onClick={handleDuplicateActiveLayer}
+                      title="Duplicate Active Layer"
+                    >
+                      📑 Dup
+                    </button>
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{ fontSize: '0.67rem', textAlign: 'center', padding: '0.25rem 0.2rem' }}
+                      onClick={handleMergeLayerDown}
+                      disabled={layers.length < 2}
+                      title="Merge Active Layer Down"
+                    >
+                      ⏬ Merge
+                    </button>
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{ fontSize: '0.67rem', textAlign: 'center', padding: '0.25rem 0.2rem' }}
+                      onClick={handleFlattenAllLayers}
+                      disabled={layers.length < 2}
+                      title="Flatten All Layers"
+                    >
+                      🥞 Flatten
+                    </button>
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{
+                        fontSize: '0.67rem',
+                        textAlign: 'center',
+                        padding: '0.25rem 0.2rem',
+                        color: '#fca5a5',
+                      }}
+                      onClick={() => handleDeleteLayer(activeLayer.id)}
+                      disabled={layers.length <= 1}
+                      title="Delete Active Layer"
+                    >
+                      🗑️ Del
+                    </button>
+                  </div>
+
+                  {/* Smart Cutout & Alpha Key Actions */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{ fontSize: '0.68rem', textAlign: 'center' }}
+                      onClick={handleKeyActiveLayerBackground}
+                      title="Remove solid white/studio background color from active layer into true alpha transparency"
+                    >
+                      ✨ Key Solid BG → Alpha
+                    </button>
+                    <button
+                      type="button"
+                      className="chip"
+                      style={{ fontSize: '0.68rem', textAlign: 'center' }}
+                      onClick={() => handlePinLayerToScratch(activeLayer)}
+                      title="Pin only the active layer to Scratch Space"
+                    >
+                      📌 Layer to Scratch
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ fontSize: '0.72rem', borderColor: '#6366f1' }}
+                    onClick={() => {
+                      setAiOutputMode('new_layer')
+                      handleRunCharacterIsolation(false)
+                    }}
+                    disabled={Boolean(activeRunId)}
+                  >
+                    ✂️ AI Isolate Subject → New Transparent Layer
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TOOLSET 1: PHOTO SOURCE, GOOGLE PHOTOS URL & RECENT GENERATIONS */}
+          {activeToolset === 'media' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.7rem' }}>
+              <div style={{ display: 'flex', gap: '0.4rem' }}>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  style={{ flex: 1, fontSize: '0.75rem' }}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  📂 Open as New Doc
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ flex: 1, fontSize: '0.75rem' }}
+                  onClick={() => addLayerFileInputRef.current?.click()}
+                >
+                  ➕ Add as Layer
+                </button>
+              </div>
+              <button
+                type="button"
+                className="btn"
+                style={{ fontSize: '0.76rem' }}
+                onClick={handleExportPNG}
+                disabled={layers.length === 0}
+              >
+                ⬇ Export Composite PNG
+              </button>
+
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontSize: '0.72rem',
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={dropAsNewLayer}
+                  onChange={(e) => setDropAsNewLayer(e.target.checked)}
+                />
+                <span>Drag &amp; drop / URL imports add as a new Layer on top</span>
+              </label>
 
               {/* Google Photos / Image URL Import */}
               <div
@@ -1156,7 +2344,7 @@ export function PhotoStudio({
 
               <div>
                 <div style={{ fontSize: '0.74rem', fontWeight: 600, marginBottom: 6 }}>
-                  Recent ComfyUI Generations
+                  Recent ComfyUI Generations (Click to Add Layer)
                 </div>
                 <div
                   style={{
@@ -1168,7 +2356,11 @@ export function PhotoStudio({
                   {recentImageOutputs.map((item, idx) => (
                     <div
                       key={`${item.filename}-${idx}`}
-                      onClick={() => pushRevision(item.url, item.title)}
+                      onClick={() =>
+                        pushRevision(item.url, item.title, {
+                          mode: layers.length > 0 ? 'new_layer' : 'new_doc',
+                        })
+                      }
                       style={{
                         cursor: 'pointer',
                         borderRadius: 6,
@@ -1176,7 +2368,7 @@ export function PhotoStudio({
                         border: '1px solid var(--border)',
                         position: 'relative',
                       }}
-                      title={`Click to load: ${item.title}`}
+                      title={`Click to add layer: ${item.title}`}
                     >
                       <img
                         src={item.url}
@@ -1190,39 +2382,111 @@ export function PhotoStudio({
             </div>
           )}
 
-          {/* TOOLSET 2: PAINT & FEATHERED MASK */}
+          {/* TOOLSET 2: PATCHY PAINT, BOX SELECT, MASK & MOVE LAYER */}
           {activeToolset === 'paint' && (
             <div
               style={{
                 display: 'flex',
                 flexDirection: 'column',
                 gap: '0.6rem',
-                fontSize: '0.76rem',
+                fontSize: '0.75rem',
               }}
             >
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.35rem' }}>
+              <div style={{ fontWeight: 600, color: '#a5b4fc', fontSize: '0.72rem' }}>
+                AI Selection &amp; Object Box Tools:
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.32rem' }}>
                 <button
                   type="button"
-                  className={`chip ${brushMode === 'brush' ? 'active' : ''}`}
-                  onClick={() => setBrushMode('brush')}
+                  className={`chip ${toolMode === 'mask_brush' ? 'active' : ''}`}
+                  onClick={() => setToolMode('mask_brush')}
+                  title="Paint ruby-red selection mask for AI inpainting"
                 >
-                  🖌️ Paint
+                  🖌️ AI Mask
                 </button>
                 <button
                   type="button"
-                  className={`chip ${brushMode === 'eraser' ? 'active' : ''}`}
-                  onClick={() => setBrushMode('eraser')}
+                  className={`chip ${toolMode === 'box_select' ? 'active' : ''}`}
+                  onClick={() => setToolMode('box_select')}
+                  title="Patchy Object Box Select: drag a box around an object to isolate or edit it"
                 >
-                  🧹 Erase
+                  📦 Box Select
                 </button>
                 <button
                   type="button"
-                  className={`chip ${brushMode === 'pan' ? 'active' : ''}`}
-                  onClick={() => setBrushMode('pan')}
+                  className={`chip ${toolMode === 'mask_eraser' ? 'active' : ''}`}
+                  onClick={() => setToolMode('mask_eraser')}
                 >
-                  👆 Cursor
+                  🧽 Mask Erase
                 </button>
               </div>
+
+              <div style={{ fontWeight: 600, color: '#a5b4fc', fontSize: '0.72rem', marginTop: 2 }}>
+                Direct Layer Paint &amp; Transform Tools:
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.32rem' }}>
+                <button
+                  type="button"
+                  className={`chip ${toolMode === 'layer_brush' ? 'active' : ''}`}
+                  onClick={() => setToolMode('layer_brush')}
+                  title="Paint color directly onto the active layer"
+                >
+                  🎨 Paint Layer
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${toolMode === 'layer_eraser' ? 'active' : ''}`}
+                  onClick={() => setToolMode('layer_eraser')}
+                  title="Erase pixels to transparency on the active layer"
+                >
+                  🧹 Erase Layer
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${toolMode === 'move_layer' ? 'active' : ''}`}
+                  onClick={() => setToolMode('move_layer')}
+                  title="Drag on the canvas to reposition the active layer"
+                >
+                  ✋ Move Layer
+                </button>
+              </div>
+
+              {toolMode === 'layer_brush' && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    padding: '0.45rem',
+                    borderRadius: 8,
+                    background: 'rgba(15, 23, 42, 0.6)',
+                    border: '1px solid var(--border)',
+                  }}
+                >
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span>Color:</span>
+                    <input
+                      type="color"
+                      value={brushColor}
+                      onChange={(e) => setBrushColor(e.target.value)}
+                      style={{ width: 28, height: 24, border: 'none', background: 'none' }}
+                    />
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1 }}>
+                    <span>Flow:</span>
+                    <input
+                      type="range"
+                      min={10}
+                      max={100}
+                      value={brushOpacity}
+                      onChange={(e) => setBrushOpacity(Number(e.target.value))}
+                      style={{ flex: 1 }}
+                    />
+                    <span>{brushOpacity}%</span>
+                  </label>
+                </div>
+              )}
 
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Brush Diameter</span>
@@ -1230,14 +2494,14 @@ export function PhotoStudio({
               </label>
               <input
                 type="range"
-                min={5}
+                min={4}
                 max={180}
                 value={brushSize}
                 onChange={(e) => setBrushSize(Number(e.target.value))}
               />
 
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Mask Feathering (Soft Edge)</span>
+                <span>Selection Feathering (Soft Edge)</span>
                 <span>{featherPx}px</span>
               </label>
               <input
@@ -1268,25 +2532,51 @@ export function PhotoStudio({
                 </button>
               </div>
 
+              {hasMask && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    style={{ fontSize: '0.73rem' }}
+                    onClick={() => {
+                      setAiOutputMode('new_layer')
+                      handleRunCharacterIsolation(true)
+                    }}
+                    disabled={Boolean(activeRunId)}
+                  >
+                    ✂️ Isolate Object in Box/Mask → New Layer (AI)
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ fontSize: '0.73rem' }}
+                    onClick={handleExtractMaskToNewLayer}
+                  >
+                    📑 Copy Masked Pixels Directly → New Layer
+                  </button>
+                </div>
+              )}
+
               <div
                 style={{
-                  padding: '0.6rem',
+                  padding: '0.55rem',
                   borderRadius: 8,
                   background: 'rgba(15, 23, 42, 0.65)',
                   border: '1px solid var(--border)',
-                  fontSize: '0.71rem',
+                  fontSize: '0.7rem',
                   color: 'var(--text-muted)',
                   lineHeight: 1.45,
                 }}
               >
-                <strong>How Localized Fill Works:</strong> Paint ruby-red over any area on the
-                canvas, then ask the AI Copilot what to change. Studio runs <em>Qwen Image Edit</em>{' '}
-                and alpha-composites only your feathered mask back onto the original image.
+                <strong>Patchy Object Box &amp; Layer Workflow:</strong> Use{' '}
+                <strong>📦 Box Select</strong> to drag a loose box around any object and click{' '}
+                <em>Isolate Object in Box → New Layer</em>, or use <strong>✋ Move Layer</strong> to
+                reposition layers over your background!
               </div>
             </div>
           )}
 
-          {/* TOOLSET 3: RASTER COLOR & CROP */}
+          {/* TOOLSET 3: NON-DESTRUCTIVE PER-LAYER ADJUSTMENTS & CROP */}
           {activeToolset === 'adjust' && (
             <div
               style={{
@@ -1296,60 +2586,68 @@ export function PhotoStudio({
                 fontSize: '0.75rem',
               }}
             >
+              <div style={{ fontSize: '0.71rem', color: '#a5b4fc', fontWeight: 600 }}>
+                Adjusting Active Layer: {activeLayer ? activeLayer.name : 'None'}
+              </div>
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Brightness</span>
-                <span>{brightness}%</span>
+                <span>{activeLayer?.brightness ?? 100}%</span>
               </label>
               <input
                 type="range"
                 min={40}
                 max={160}
-                value={brightness}
-                onChange={(e) => setBrightness(Number(e.target.value))}
+                value={activeLayer?.brightness ?? 100}
+                onChange={(e) => updateActiveLayer({ brightness: Number(e.target.value) })}
+                disabled={!activeLayer}
               />
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Contrast</span>
-                <span>{contrast}%</span>
+                <span>{activeLayer?.contrast ?? 100}%</span>
               </label>
               <input
                 type="range"
                 min={40}
                 max={160}
-                value={contrast}
-                onChange={(e) => setContrast(Number(e.target.value))}
+                value={activeLayer?.contrast ?? 100}
+                onChange={(e) => updateActiveLayer({ contrast: Number(e.target.value) })}
+                disabled={!activeLayer}
               />
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Saturation</span>
-                <span>{saturation}%</span>
+                <span>{activeLayer?.saturation ?? 100}%</span>
               </label>
               <input
                 type="range"
                 min={0}
                 max={200}
-                value={saturation}
-                onChange={(e) => setSaturation(Number(e.target.value))}
+                value={activeLayer?.saturation ?? 100}
+                onChange={(e) => updateActiveLayer({ saturation: Number(e.target.value) })}
+                disabled={!activeLayer}
               />
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Warmth / Sepia</span>
-                <span>{warmth}%</span>
+                <span>{activeLayer?.warmth ?? 0}%</span>
               </label>
               <input
                 type="range"
                 min={0}
                 max={100}
-                value={warmth}
-                onChange={(e) => setWarmth(Number(e.target.value))}
+                value={activeLayer?.warmth ?? 0}
+                onChange={(e) => updateActiveLayer({ warmth: Number(e.target.value) })}
+                disabled={!activeLayer}
               />
               <label style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Gaussian Blur</span>
-                <span>{blurPx}px</span>
+                <span>{activeLayer?.blurPx ?? 0}px</span>
               </label>
               <input
                 type="range"
                 min={0}
                 max={12}
-                value={blurPx}
-                onChange={(e) => setBlurPx(Number(e.target.value))}
+                value={activeLayer?.blurPx ?? 0}
+                onChange={(e) => updateActiveLayer({ blurPx: Number(e.target.value) })}
+                disabled={!activeLayer}
               />
 
               <div style={{ display: 'flex', gap: '0.35rem', marginTop: 4 }}>
@@ -1358,26 +2656,30 @@ export function PhotoStudio({
                   className="btn btn-primary"
                   style={{ flex: 1, fontSize: '0.74rem' }}
                   onClick={handleBakeAdjustments}
+                  disabled={!activeLayer}
                 >
                   ✨ Bake to Layer
                 </button>
                 <button
                   type="button"
                   className="chip"
-                  onClick={() => {
-                    setBrightness(100)
-                    setContrast(100)
-                    setSaturation(100)
-                    setWarmth(0)
-                    setBlurPx(0)
-                  }}
+                  disabled={!activeLayer}
+                  onClick={() =>
+                    updateActiveLayer({
+                      brightness: 100,
+                      contrast: 100,
+                      saturation: 100,
+                      warmth: 0,
+                      blurPx: 0,
+                    })
+                  }
                 >
                   Reset
                 </button>
               </div>
 
               <hr style={{ border: 'none', borderTop: '1px solid var(--border)', margin: '0.35rem 0' }} />
-              <div style={{ fontWeight: 600 }}>Rotate &amp; Flip</div>
+              <div style={{ fontWeight: 600 }}>Rotate &amp; Flip Active Layer</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem' }}>
                 <button type="button" className="chip" onClick={() => handleTransform('rot_ccw')}>
                   ↺ Rotate -90°
@@ -1393,7 +2695,7 @@ export function PhotoStudio({
                 </button>
               </div>
 
-              <div style={{ fontWeight: 600, marginTop: 4 }}>Center Aspect Crop</div>
+              <div style={{ fontWeight: 600, marginTop: 4 }}>Document Aspect Crop</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem' }}>
                 <button type="button" className="chip" onClick={() => handleAspectCrop(1, 1)}>
                   1:1 Square
@@ -1422,7 +2724,7 @@ export function PhotoStudio({
               }}
             >
               <div style={{ fontWeight: 600, color: '#a5b4fc' }}>
-                Step 1: Isolate Character / Group
+                Step 1: Isolate Character / Group to Layer
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.3rem' }}>
                 <button
@@ -1447,7 +2749,7 @@ export function PhotoStudio({
                   style={{ fontSize: '0.7rem' }}
                   onClick={() => setIsolationTarget('masked')}
                 >
-                  🖌️ Painted Mask
+                  📦 Box / Mask
                 </button>
                 <button
                   type="button"
@@ -1473,6 +2775,15 @@ export function PhotoStudio({
               <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
                 <input
                   type="checkbox"
+                  checked={autoKeyCutoutBg}
+                  onChange={(e) => setAutoKeyCutoutBg(e.target.checked)}
+                />
+                <span>Auto-key solid background to transparent alpha</span>
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
                   checked={figurinePrepass}
                   onChange={(e) => setFigurinePrepass(e.target.checked)}
                 />
@@ -1483,8 +2794,8 @@ export function PhotoStudio({
                 type="button"
                 className="btn"
                 style={{ width: '100%', fontSize: '0.75rem', borderColor: '#6366f1' }}
-                onClick={handleRunCharacterIsolation}
-                disabled={!currentRevision || Boolean(activeRunId)}
+                onClick={() => handleRunCharacterIsolation(false)}
+                disabled={layers.length === 0 || Boolean(activeRunId)}
               >
                 ✂️ 1. Isolate &amp; Remove BG (Qwen 2.1)
               </button>
@@ -1551,7 +2862,7 @@ export function PhotoStudio({
                 className="btn btn-primary"
                 style={{ width: '100%', fontSize: '0.76rem' }}
                 onClick={handleRun3DPipeline}
-                disabled={!currentRevision || Boolean(activeRunId)}
+                disabled={layers.length === 0 || Boolean(activeRunId)}
               >
                 🧊 2. Create 3D Mesh + Texture + Render
               </button>
@@ -1566,9 +2877,9 @@ export function PhotoStudio({
                 className="btn btn-primary"
                 style={{ fontSize: '0.75rem' }}
                 onClick={handlePinCurrentToScratch}
-                disabled={!currentRevision}
+                disabled={layers.length === 0}
               >
-                📌 Pin Current Canvas to Scratch Space
+                📌 Pin Composite to Scratch Space
               </button>
               <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
                 Scratch Space holds intermediate cutouts, video frames, textures, and clips across
@@ -1671,9 +2982,21 @@ export function PhotoStudio({
                               type="button"
                               className="chip"
                               style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
-                              onClick={() => pushRevision(item.url, item.label)}
+                              onClick={() =>
+                                pushRevision(item.url, item.label, { mode: 'new_layer' })
+                              }
                             >
-                              🖼️ To Canvas
+                              ➕ Add as Layer
+                            </button>
+                            <button
+                              type="button"
+                              className="chip"
+                              style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
+                              onClick={() =>
+                                pushRevision(item.url, item.label, { mode: 'new_doc' })
+                              }
+                            >
+                              🖼️ Replace Doc
                             </button>
                             <button
                               type="button"
@@ -1682,10 +3005,10 @@ export function PhotoStudio({
                               onClick={() => {
                                 setSecondImageB64(item.url)
                                 setSecondImageName(item.label)
-                                setStatusBanner(`Set "${item.label}" as Reference / 3D Texture`)
+                                setStatusBanner(`Set "${item.label}" as 2nd Ref / 3D Texture!`)
                               }}
                             >
-                              🎨 Use as Ref/Tex
+                              🎨 Use as Tex/Ref
                             </button>
                             <button
                               type="button"
@@ -1705,11 +3028,21 @@ export function PhotoStudio({
                             onClick={() =>
                               setActive3DModel({
                                 url: item.url,
-                                filename: item.filename || 'model.glb',
+                                filename: item.filename || item.label,
                               })
                             }
                           >
                             🧊 Open 3D Viewer
+                          </button>
+                        )}
+                        {item.kind === 'video' && (
+                          <button
+                            type="button"
+                            className="chip"
+                            style={{ fontSize: '0.66rem', padding: '0.12rem 0.4rem' }}
+                            onClick={() => onSendToVideoStudio(item.url, item.label)}
+                          >
+                            🎬 Open in Video Studio
                           </button>
                         )}
                       </div>
@@ -1722,7 +3055,7 @@ export function PhotoStudio({
         </aside>
       )}
 
-      {/* CENTER WORKSPACE: Interactive Dual-Canvas + 3D Material Studio + Bottom Revision Strip */}
+      {/* CENTER WORKSPACE: Multi-Layer Interactive Canvas + 3D Material Studio + Bottom Revision Strip */}
       <main
         onDragOver={(e) => {
           e.preventDefault()
@@ -1760,13 +3093,16 @@ export function PhotoStudio({
           >
             <div style={{ fontSize: '2.4rem' }}>📥</div>
             <div style={{ fontSize: '1rem', fontWeight: 700 }}>
-              Drop Photo File or Google Photos Link Here
+              {layers.length > 0 && dropAsNewLayer
+                ? 'Drop Photo or Google Photos Link to Add as New Layer'
+                : 'Drop Photo File or Google Photos Link Here'}
             </div>
             <div style={{ fontSize: '0.78rem', color: '#a5b4fc' }}>
               Supports File Manager files (PNG/JPG/WebP) and browser image/link drags
             </div>
           </div>
         )}
+
         {/* Top Canvas Toolbar */}
         <div
           style={{
@@ -1781,12 +3117,26 @@ export function PhotoStudio({
             gap: '0.4rem',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span style={{ fontWeight: 600 }}>
-              {currentRevision
-                ? `${currentRevision.label} (${currentRevision.width}×${currentRevision.height})`
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 700 }}>
+              {layers.length > 0
+                ? `${docSize.width}×${docSize.height} • ${layers.length} Layer${layers.length > 1 ? 's' : ''}`
                 : 'Empty Canvas'}
             </span>
+            {activeLayer && (
+              <span
+                style={{
+                  background: 'rgba(99, 102, 241, 0.18)',
+                  color: '#c7d2fe',
+                  padding: '0.1rem 0.48rem',
+                  borderRadius: 999,
+                  fontSize: '0.68rem',
+                  fontWeight: 600,
+                }}
+              >
+                📑 Active: {activeLayer.name}
+              </span>
+            )}
             {hasMask && (
               <span
                 style={{
@@ -1798,7 +3148,7 @@ export function PhotoStudio({
                   fontWeight: 600,
                 }}
               >
-                🖌️ Mask Active
+                🖌️ Selection Active
               </span>
             )}
           </div>
@@ -1807,7 +3157,7 @@ export function PhotoStudio({
             <button
               type="button"
               className="chip"
-              onClick={() => setActiveRevIndex((i) => Math.max(0, i - 1))}
+              onClick={() => selectRevisionIndex(Math.max(0, activeRevIndex - 1))}
               disabled={activeRevIndex <= 0}
             >
               ↩ Undo
@@ -1815,7 +3165,9 @@ export function PhotoStudio({
             <button
               type="button"
               className="chip"
-              onClick={() => setActiveRevIndex((i) => Math.min(revisions.length - 1, i + 1))}
+              onClick={() =>
+                selectRevisionIndex(Math.min(revisions.length - 1, activeRevIndex + 1))
+              }
               disabled={activeRevIndex >= revisions.length - 1}
             >
               ↪ Redo
@@ -1850,13 +3202,13 @@ export function PhotoStudio({
             <button type="button" className="chip" onClick={() => setZoom(1.0)}>
               100%
             </button>
-            {currentRevision && (
+            {layers.length > 0 && (
               <>
                 <button
                   type="button"
                   className="chip"
                   onClick={handlePinCurrentToScratch}
-                  title="Pin current canvas layer to Scratch Space"
+                  title="Pin composited canvas to Scratch Space"
                 >
                   📌 To Scratch
                 </button>
@@ -1864,9 +3216,15 @@ export function PhotoStudio({
                   type="button"
                   className="btn"
                   style={{ padding: '0.18rem 0.55rem', fontSize: '0.72rem' }}
-                  onClick={() =>
-                    onSendToVideoStudio(currentRevision.dataUrl, currentRevision.label)
-                  }
+                  onClick={() => {
+                    const c = baseCanvasRef.current
+                    if (c) {
+                      onSendToVideoStudio(
+                        c.toDataURL('image/png'),
+                        activeLayer?.name || 'Composite',
+                      )
+                    }
+                  }}
                 >
                   🎬 To Video
                 </button>
@@ -1950,22 +3308,22 @@ export function PhotoStudio({
                 url={active3DModel.url}
                 filename={active3DModel.filename}
                 height={330}
-                textureCandidateUrl={secondImageB64 || currentRevision?.dataUrl || null}
+                textureCandidateUrl={secondImageB64 || activeLayer?.dataUrl || null}
                 onCaptureRenderToCanvas={(dataUrl, label) => {
-                  pushRevision(dataUrl, label)
+                  pushRevision(dataUrl, label, { mode: 'new_layer' })
                   onAddScratchItem({
                     kind: 'image',
                     label,
                     url: dataUrl,
                     metaText: '3D Snapshot',
                   })
-                  setStatusBanner('Captured 3D Render onto Canvas & Scratch Space!')
+                  setStatusBanner('Captured 3D Render onto a new Layer & Scratch Space!')
                 }}
               />
             </div>
           )}
 
-          {currentRevision ? (
+          {layers.length > 0 ? (
             <div
               style={{
                 position: 'relative',
@@ -1987,22 +3345,22 @@ export function PhotoStudio({
               />
               <canvas
                 ref={maskCanvasRef}
-                onMouseDown={(e) => {
-                  setIsPainting(true)
-                  paintAtEvent(e)
-                }}
-                onMouseMove={(e) => {
-                  if (isPainting) paintAtEvent(e)
-                }}
-                onMouseUp={() => setIsPainting(false)}
-                onMouseLeave={() => setIsPainting(false)}
+                onMouseDown={handleCanvasMouseDown}
+                onMouseMove={handleCanvasMouseMove}
+                onMouseUp={handleCanvasMouseUp}
+                onMouseLeave={handleCanvasMouseUp}
                 style={{
                   position: 'absolute',
                   inset: 0,
                   width: '100%',
                   height: '100%',
                   opacity: showMaskOverlay ? 1 : 0,
-                  cursor: brushMode === 'pan' ? 'grab' : 'crosshair',
+                  cursor:
+                    toolMode === 'move_layer'
+                      ? 'move'
+                      : toolMode === 'box_select'
+                        ? 'crosshair'
+                        : 'crosshair',
                 }}
               />
             </div>
@@ -2017,14 +3375,23 @@ export function PhotoStudio({
                 maxWidth: 460,
               }}
             >
-              <div style={{ fontSize: '2.2rem', marginBottom: '0.5rem' }}>🖼️</div>
+              <div style={{ fontSize: '2.2rem', marginBottom: '0.5rem' }}>📑</div>
               <div style={{ fontWeight: 600, color: 'var(--text-main)', marginBottom: 6 }}>
-                No Photo Loaded Yet
+                Patchy Multi-Layer Photo &amp; 3D Studio
               </div>
               <div style={{ fontSize: '0.8rem', marginBottom: '1rem', lineHeight: 1.5 }}>
-                Drag &amp; drop a file from your File Manager, drop or paste a Google Photos share link (`Ctrl+V`), pick from Scratch Space (`🗂️`), or ask the AI Copilot on the right to generate a brand-new image!
+                Drag &amp; drop photos from your File Manager, drop or paste a Google Photos share
+                link (`Ctrl+V`), pick from Scratch Space (`🗂️`), or ask the AI Copilot to generate
+                layers!
               </div>
-              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center', marginBottom: '0.75rem' }}>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: '0.5rem',
+                  justifyContent: 'center',
+                  marginBottom: '0.75rem',
+                }}
+              >
                 <button
                   type="button"
                   className="btn btn-primary"
@@ -2099,7 +3466,7 @@ export function PhotoStudio({
           {revisions.map((rev, idx) => (
             <div
               key={rev.id}
-              onClick={() => setActiveRevIndex(idx)}
+              onClick={() => selectRevisionIndex(idx)}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -2119,7 +3486,7 @@ export function PhotoStudio({
                 alt={rev.label}
                 style={{ width: 34, height: 34, objectFit: 'cover', borderRadius: 4 }}
               />
-              <div style={{ fontSize: '0.68rem', maxWidth: 110 }}>
+              <div style={{ fontSize: '0.68rem', maxWidth: 115 }}>
                 <div
                   style={{
                     fontWeight: 600,
@@ -2131,6 +3498,7 @@ export function PhotoStudio({
                   {idx + 1}. {rev.label}
                 </div>
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
+                  {rev.layersSnapshot ? `${rev.layersSnapshot.length}L • ` : ''}
                   {rev.width}×{rev.height}
                 </div>
               </div>
@@ -2365,7 +3733,7 @@ export function PhotoStudio({
               className="search-input"
               placeholder={
                 hasMask
-                  ? 'Describe what to put in painted mask...'
+                  ? 'Describe what to put in selection/box...'
                   : 'Ask Copilot to edit, isolate, make 3D...'
               }
               value={chatInput}
